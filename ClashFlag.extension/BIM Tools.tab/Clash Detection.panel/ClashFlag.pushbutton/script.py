@@ -127,6 +127,37 @@ also needs it) - with the camera-reframe call now queued through
 would have been the still-valid first auto-selected clash, rather than
 special-casing "first call is fine, later ones need the bridge."
 
+LIVE-TESTING FIX (reopened again, after Phase 7 round 4 closed this ticket -
+see tickets/1004-camera-fly-to-clash.md's "Reopened again - live-testing
+gap" section): the tool's actual user, stepping through a real clash list in
+Revit 2024.3, reported that the camera reframe alone doesn't tell you WHICH
+two elements (out of potentially several visible after the view moves) are
+the ones actually clashing - Revit's own Interference Check "Show" button,
+which this ticket was built to be "equivalent to," both reframes the camera
+AND selects/highlights the clashing pair. The selection half was never
+implemented, and three prior review rounds on this ticket never caught the
+gap - there was no live Revit session available in this sandbox to actually
+look at a reframed view and notice nothing was highlighted in it. Fixed by
+adding ``select_clash_pair`` (see the "CAMERA FLY-TO-CLASH" section below),
+which builds a host ``Reference`` plus a link-scoped ``Reference`` (via
+``Reference(link_element).CreateLinkReference(link_instance)``) and calls
+``host_uidoc.Selection.SetReferences([host_reference, link_reference])`` -
+the only Revit API surface that can select an element living inside a
+linked document (``Selection.SetElementIds`` cannot, since it only accepts
+``ElementId`` values meaningful in the host document - the same cross-
+document-id limitation ``apply_colorize_overrides`` already had to work
+around for graphic overrides, see "ADDED IN 1005" below). Called from
+``reframe_active_view_on_clash`` itself, unconditionally, before the
+3D-view check - so it runs through the exact same ``_revit_api_bridge``-
+queued closure as the camera reframe, satisfying the same valid-API-context
+requirement, without needing a second call site or a second bridge queue
+entry. Like the camera zoom, this does not need a ``Transaction`` - Revit's
+active Selection is transient UI state, not persisted model/view data -
+though this was verified on its own rather than assumed purely by analogy,
+since ``Selection``/``Reference`` is a different part of the API surface
+than ``UIView.ZoomAndCenterRectangle``. See ``select_clash_pair``'s own
+docstring for the full source trail.
+
 ADDED IN 1005 (T-5, this revision): colorize-by-category (US-5), via a new
 "Colorize clashes by category" checkbox in ``ClashListWindow`` (see
 ``clashflag_clash_list.xaml``'s ``ColorizeCheckBox``) and its
@@ -294,6 +325,7 @@ from Autodesk.Revit.DB import (
     Options,
     Outline,
     OverrideGraphicSettings,
+    Reference,
     RevitLinkInstance,
     Solid,
     SolidUtils,
@@ -1148,7 +1180,13 @@ class ClashResult(object):
 
 
 # ---------------------------------------------------------------------------
-# CAMERA FLY-TO-CLASH (T-4 / ticket 1004)
+# CAMERA FLY-TO-CLASH + SELECTION HIGHLIGHT (T-4 / ticket 1004)
+#
+# The selection half (select_clash_pair, below) was added after a live-
+# testing report on a real Revit 2024.3 session, following this file's
+# fourth Phase 7 review pass on this ticket - see the module docstring's
+# "LIVE-TESTING FIX" section and tickets/1004-camera-fly-to-clash.md's
+# "Reopened again - live-testing gap" section for the full story.
 # ---------------------------------------------------------------------------
 
 def _pad_bounding_box(box_min, box_max, fraction):
@@ -1277,13 +1315,152 @@ def _combined_host_space_bounding_box(clash_result, host_doc, active_view):
     return combined_min, combined_max
 
 
+def select_clash_pair(clash_result, host_doc, host_uidoc):
+    """Select/highlight BOTH elements of `clash_result` in the Revit UI - the
+    host element directly, and the link element via a link-scoped
+    ``Reference`` - so the user can actually tell WHICH two elements (out of
+    potentially many visible once the camera reframes) are the ones really
+    clashing. This is the other half of "equivalent to Revit's built-in
+    Interference Check 'Show' button": that button both reframes the camera
+    AND selects/highlights the clashing pair - only the reframe half was
+    ever implemented here.
+
+    LIVE-TESTING GAP, NOT A REVIEW MISS (see tickets/1004-camera-fly-to-
+    clash.md's "Reopened again - live-testing gap" section): three prior
+    Phase 7 review rounds on this ticket read and re-verified
+    ``reframe_active_view_on_clash`` and its "equivalent to Show" framing
+    without ever flagging that the selection half was missing, because there
+    was no live Revit session available in this sandbox to actually look at
+    a reframed view and notice nothing was highlighted in it. It surfaced
+    only when the tool's real user stepped through an actual clash list in
+    Revit 2024.3 and could not tell which two elements, among everything
+    else visible after the camera moved, were the reported clash.
+
+    API CHOICE - RESEARCHED, NOT GUESSED: selecting an element that lives in
+    a LINKED document, from the host view/document, is NOT expressible via
+    ``Selection.SetElementIds`` - that method only accepts ``ElementId``
+    values meaningful in the host document, and a linked element's own
+    ``ElementId`` is only meaningful inside its own (linked) document (the
+    exact same cross-document-id trap ``apply_colorize_overrides`` already
+    had to work around for graphic overrides - see this module's "ADDED IN
+    1005" docstring section). The mechanism actually used here:
+        host_reference = Reference(host_element)
+        link_reference = Reference(link_element).CreateLinkReference(link_instance)
+        host_uidoc.Selection.SetReferences([host_reference, link_reference])
+    Verified via multiple independent sources, not just assumed from a
+    single writeup:
+      - ``Reference(Element)`` - a real constructor on
+        ``Autodesk.Revit.DB.Reference``, confirmed via revitapidocs.com's
+        Reference Constructor page.
+      - ``Reference.CreateLinkReference(RevitLinkInstance)`` - confirmed via
+        revitapidocs.com's own CreateLinkReference method page ("Creates a
+        new reference to an object found in a linked document, from a
+        reference to that same object obtained by looking directly in the
+        linked document") and independently via Jeremy Tammik's Building
+        Coder ("Conversion of a Geometric Reference in a Linked RVT Model").
+      - ``Selection.SetReferences(IList<Reference>)`` - confirmed via
+        revitapidocs.com's Selection Methods page ("Selects the references.
+        The references can be an element or a subelement in the host or a
+        linked document.") AND a separate, independent worked example
+        (SharpBIM, "Highlight elements from a linked document") building
+        this EXACT host-reference-plus-CreateLinkReference-converted-link-
+        reference pattern to highlight a linked element from the host UI.
+        Selecting a linked-document reference this way was added in the
+        Revit 2023 API - already satisfied by this tool's Revit 2024.3
+        target, but worth a second look if this file is ever back-ported to
+        an older Revit version.
+
+    NO TRANSACTION: like ``ZoomAndCenterRectangle`` (see
+    ``reframe_active_view_on_clash``'s own "NO TRANSACTION" note below), the
+    active Selection is transient Revit UI state, not a persisted model or
+    view property - confirmed rather than assumed purely by analogy:
+    independent Revit-API discussion of ``Selection.SetElementIds``/
+    ``SetReferences`` describes both as only ever changing what's
+    highlighted in the UI, never touching the model, so - like the camera
+    zoom - no ``Transaction`` is opened here. (This IS a different part of
+    the API surface than ``ZoomAndCenterRectangle`` - a ``UIView`` viewport
+    method vs. a ``UIDocument.Selection`` method - so this was checked on
+    its own rather than treated as automatically true "because zoom didn't
+    need one either.")
+
+    CALLER'S RESPONSIBILITY - VALID API CONTEXT: same requirement as every
+    other Revit-API-touching function in this file (see
+    ``reframe_active_view_on_clash``'s own note on this) - this function
+    must only ever run from inside a ``_revit_api_bridge``-queued closure,
+    never called directly from a ``ClashListWindow`` WPF handler.
+
+    Returns True if the selection was set, False if it failed (e.g. the host
+    element, the link element, or the link instance itself was deleted/
+    unloaded since the run that found this clash) - reported via
+    ``output.print_md``, never raised, so a stale reference can't abort the
+    reframe half of this action too.
+    """
+    try:
+        link_instance = resolve_link_instance_by_id(
+            host_doc, clash_result.link_instance_id
+        )
+    except ClashFlagError as link_error:
+        output.print_md(
+            "_ClashFlag: could not select the clashing pair - {0}_".format(
+                link_error
+            )
+        )
+        return False
+
+    try:
+        host_reference = Reference(clash_result.host_element)
+        link_reference = Reference(clash_result.link_element).CreateLinkReference(
+            link_instance
+        )
+    except Exception as reference_error:
+        output.print_md(
+            "_ClashFlag: could not build a selection reference for this "
+            "clash (an element may have been deleted since the run that "
+            "found it): {0}_".format(reference_error)
+        )
+        return False
+
+    try:
+        host_uidoc.Selection.SetReferences(
+            List[Reference]([host_reference, link_reference])
+        )
+    except Exception as selection_error:
+        output.print_md(
+            "_ClashFlag: could not select the clashing pair: {0}_".format(
+                selection_error
+            )
+        )
+        return False
+
+    return True
+
+
 def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
     """Reframe the ACTIVE view's camera onto the combined bounding box of
-    `clash_result`'s two clashing elements - the camera-fly-to behavior from
-    US-4 / ticket 1004, equivalent to what Revit's built-in Interference
-    Check dialog's "Show" button does for a found clash.
+    `clash_result`'s two clashing elements, AND select/highlight both
+    clashing elements (see ``select_clash_pair`` above) - together, the
+    camera-fly-to-and-highlight behavior from US-4 / ticket 1004, equivalent
+    to what Revit's built-in Interference Check dialog's "Show" button does
+    for a found clash. (The selection half was added after the camera-only
+    version of this function had already been through three Phase 7 review
+    rounds - see ``select_clash_pair``'s "LIVE-TESTING GAP" docstring note
+    for why, and tickets/1004-camera-fly-to-clash.md's "Reopened again"
+    section for the live-testing report that caught it.)
 
-    CALLER'S RESPONSIBILITY - VALID API CONTEXT (Phase 7 round 3 fix): this
+    Selection and reframe are two independent steps run back-to-back here,
+    not one all-or-nothing operation: selecting doesn't require a 3D view
+    (unlike the camera reframe below) and a failure in one half (e.g. a
+    deleted element for selection, or no open 3D `UIView` for the reframe)
+    must not silently prevent the other half from still doing its part - so
+    ``select_clash_pair`` is called first, unconditionally, before the
+    3D-view check that can skip the reframe half entirely. Both this
+    function's own call site (``__main__``'s ``_reframe`` closure) and this
+    function itself treat "select and reframe" as ONE queued bridge action
+    (see the "CALLER'S RESPONSIBILITY" note below) even though the two steps
+    inside it can succeed/fail independently of each other.
+
+    CALLER'S RESPONSIBILITY - VALID API CONTEXT (Phase 7 round 3 fix; applies
+    equally to the ``select_clash_pair`` call this function makes): this
     function itself assumes it is already running inside a valid Revit API
     execution context - it does not, and cannot, establish one. Every call
     site (``__main__``'s ``_on_clash_selection_changed`` closure) MUST queue
@@ -1297,13 +1474,21 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
     unaffected by being called from inside ``_RevitApiBridge.Execute()``
     instead of directly - it never raises out of itself either way, so
     ``Execute()``'s own outer try/except around each queued action is just a
-    backstop, not something this function relies on.
+    backstop, not something this function relies on. ``select_clash_pair``
+    has this exact same property (never raises, reports via
+    ``output.print_md``) for the same reason.
 
-    Returns True if the view was reframed, False if it was skipped (reported
-    via ``output.print_md`` - a one-line console note, NOT a modal
+    Returns True if the CAMERA was reframed, False if that half was skipped
+    (reported via ``output.print_md`` - a one-line console note, NOT a modal
     ``forms.alert`` - this runs on every clash-list navigation step, and a
     popup on every click would be far more disruptive than a console line
-    the user can ignore while stepping through the list).
+    the user can ignore while stepping through the list). This return value
+    reflects the reframe outcome only - ``select_clash_pair``'s own
+    True/False result is intentionally not folded into it (this function's
+    callers, per ticket 1004, only ever care about the reframe outcome; the
+    selection call already reports its own failures independently via
+    ``output.print_md``, exactly like every other soft-failure in this
+    function).
 
     ACTIVE-VIEW-NOT-3D HANDLING (ticket instruction #4): if the active view
     is not a ``View3D`` (covers "no active view" too, since None also fails
@@ -1361,6 +1546,15 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
     either document, so no ``Transaction`` is opened here, consistent with
     the rest of this file's read-only design (see the module docstring).
     """
+    # Select/highlight the clashing pair FIRST, unconditionally - this does
+    # not require a 3D view (unlike the camera reframe below) and its
+    # success/failure is independent of whether the reframe itself goes on
+    # to succeed - see this function's own "Selection and reframe are two
+    # independent steps" docstring paragraph above and select_clash_pair's
+    # docstring for the full research trail on why this fixes a genuine,
+    # live-testing-caught gap against the "equivalent to Show button" goal.
+    select_clash_pair(clash_result, host_doc, host_uidoc)
+
     active_view = host_doc.ActiveView
     if not isinstance(active_view, View3D):
         output.print_md(

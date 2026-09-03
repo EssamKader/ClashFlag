@@ -1,4 +1,4 @@
-label: done
+label: ready-for-agent
 
 # T-5: Colorize clashes by category toggle
 
@@ -190,4 +190,69 @@ without a much more invasive mechanism than a toggle checkbox should carry.
 Amending specs/clash-flag.md's US-5 wording now to say "host-side clashing
 elements" per option 3, so the spec matches shipped scope. Closing.
 
-**Closed.**
+**Closed.** *(reopened below — live-testing bug found)*
+
+## Reopened: live-testing bug, unresolved, paused for tomorrow (2026-09-04)
+
+Real bug found running the deployed extension in actual Revit 2024.3
+(NPC-RCC-3DM-BIM-STR-ER3-0001.rvt): clicking "Colorize clashes by category"
+does not visibly check the box and no colors change. Diagnosed live via a
+Revit MCP connection (`send_code_to_revit`, C# executed directly in the
+user's running Revit process) rather than guessing — findings, in order:
+
+1. **Ruled out: disabled/hidden control.** Read the LIVE `ColorizeCheckBox`
+   object straight out of the running window via `PresentationSource
+   .CurrentSources` (since this bare `Window` has no `Application.Current`
+   backing it, unlike a normal WPF app) — `IsEnabled=True`,
+   `IsHitTestVisible=True`, `Visibility=Visible`, correctly sized
+   (637.6x15), no disabled ancestor anywhere up the visual tree. The control
+   itself is completely healthy.
+2. **Ruled out: click-delivery/DPI/rendering issue.** Programmatically set
+   `cb.IsChecked = true` directly on the live object from C# — this bypasses
+   mouse-click delivery entirely and, in WPF, still fires the `Checked`
+   routed event exactly as a real click would. It DID take effect
+   (`IsChecked` became `True`), proving the WPF event-wiring
+   (`Checked="colorize_checkbox_checked"` in the XAML) itself is intact and
+   the CLR event genuinely reaches Python code.
+3. **Ruled out: duplicate/stale window.** Only one "ClashFlag - Clash List"
+   window exists at a time (checked explicitly, not assumed) — not a case of
+   inspecting an old leftover instance.
+4. **Confirmed: a real Python-level crash inside the handler.** Forcing a
+   True→False transition (`cb.IsChecked = false`) threw, captured with a full
+   live stack trace:
+   ```
+   IronPython.Runtime.UnboundNameException: name '_revit_api_bridge' is not defined
+      at ... colorize_checkbox_checked/_clear_colorize_if_active (via CallSite.Target) ...
+      at System.Windows.Controls.Primitives.ToggleButton.OnIsCheckedChanged
+   ```
+   This is a genuine `NameError` at the exact line
+   `_revit_api_bridge.raise_action(...)` inside the checked/unchecked
+   handlers — despite `_revit_api_bridge = _RevitApiBridge()` being a
+   plain module-level global, defined earlier in the same file, with no
+   local shadowing anywhere in either handler's body (re-read the source
+   directly to confirm this, not assumed).
+5. **Ruled out: pyRevit engine/script caching.** User did a full pyRevit
+   Reload + closed the old window + reran the tool fresh from the ribbon
+   button — identical failure persisted. So this is not stale bytecode from
+   before the `_colorize_api_bridge` → `_revit_api_bridge` rename.
+
+**Open mystery for tomorrow:** why a plainly-defined module-level global,
+successfully used elsewhere in the same module (the 1004 camera-fly-to
+callback reads the same `_revit_api_bridge` successfully — camera fly-to
+works in this exact live session), is reported as unbound specifically from
+inside `ClashListWindow`'s `colorize_checkbox_checked`/`_clear_colorize_if_active`
+methods. Leading hypothesis to check next: something about how pyRevit's
+script loader/engine executes `script.py` may give class method bodies a
+DIFFERENT effective global namespace than top-level module code in some
+circumstance — worth checking pyRevit's own engine source/docs for how it
+sets `__globals__`/`func_globals` for methods defined inside a class in a
+script-loaded module, rather than assuming normal CPython/IronPython module
+scoping applies identically. Also worth trying live: read
+`colorize_checkbox_checked.__globals__` (or IronPython's equivalent) directly
+via `send_code_to_revit` reflection to see what module dict it's actually
+bound to, and whether `_revit_api_bridge` is present in THAT dict under a
+different identity than the one the top-level script scope holds.
+
+**Status:** paused mid-investigation at the user's request ("let's complete
+tomorrow") — not resolved, not re-closed. Resume by continuing the live
+Revit MCP diagnostic described above.
