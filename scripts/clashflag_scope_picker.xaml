@@ -1,0 +1,63 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ClashFlag - Scope Picker"
+        Height="560" Width="760"
+        MinHeight="420" MinWidth="600"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="CanResizeWithGrip">
+    <!--
+    T-2 / ticket 1002 scope picker (US-1). Loaded via pyrevit.forms.WPFWindow
+    from clashflag_runner.py - see ScopePickerWindow there.
+
+    No x:Class here on purpose: pyRevit's WPFWindow loads this file straight
+    into an already-constructed Python object via a XAML-only load (not a
+    compiled code-behind partial class), which is the standard pattern for
+    pyRevit WPF forms - the same pattern every other pyRevit WPFWindow xaml
+    file uses.
+
+    HostCategoriesStack and LinksStack are deliberately left EMPTY here: the
+    actual checkboxes are built at runtime in Python (ScopePickerWindow),
+    because the set of categories present and the set of loaded links are
+    both only known once the active document is inspected when the picker
+    opens - they can't be hardcoded into static XAML.
+    -->
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0"
+                   Text="Pick which host categories to check, and which loaded linked models (with which of their own categories) to check them against. Nothing runs until you click Run Check."
+                   TextWrapping="Wrap"
+                   Margin="0,0,0,10"/>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="1.6*"/>
+            </Grid.ColumnDefinitions>
+
+            <GroupBox Grid.Column="0" Header="Host categories (active model)">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="HostCategoriesStack" Margin="4"/>
+                </ScrollViewer>
+            </GroupBox>
+
+            <GroupBox Grid.Column="2" Header="Loaded linked models">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="LinksStack" Margin="4"/>
+                </ScrollViewer>
+            </GroupBox>
+        </Grid>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button x:Name="CancelButton" Content="Cancel" Width="90" Height="28" Margin="0,0,8,0"
+                    Click="cancel_button_click"/>
+            <Button x:Name="RunButton" Content="Run Check" Width="110" Height="28"
+                    Click="run_button_click" IsDefault="True"/>
+        </StackPanel>
+    </Grid>
+</Window>
