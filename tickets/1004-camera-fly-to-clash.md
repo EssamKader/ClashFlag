@@ -1,4 +1,4 @@
-label: ready-for-agent
+label: done
 
 # T-4: Camera auto-navigation to selected clash
 
@@ -214,3 +214,127 @@ uniform behavior is simpler and more robust than relying on that timing
 distinction staying true forever.
 
 **Status:** reopened, needs rework.
+
+## Fix applied (Phase 7 round 3)
+
+Applied exactly the fix the round-2 reopen prescribed, in `scripts/clashflag_runner.py`:
+
+1. **Renamed the bridge.** `_ColorizeApiBridge` → `_RevitApiBridge` and
+   `_colorize_api_bridge` → `_revit_api_bridge`, everywhere: the class
+   definition, its `__init__`/`raise_action`/`Execute`/`GetName` members, the
+   module-level instance line and its explanatory comment, both call sites in
+   1005's `colorize_checkbox_checked`/`_clear_colorize_if_active`, the module
+   docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY" section, and the
+   section-header comment immediately above the class (retitled from
+   "COLORIZE BY CATEGORY" framing to "REVIT API BRIDGE", since the bridge
+   itself is no longer colorize-specific — the colorize-only research
+   discussion that used to live under that header is called out separately
+   now). `Execute()`'s failure-report message was also reworded from
+   "colorize action failed" to "a queued action failed", since it now reports
+   failures for both colorize and camera-reframe actions. The only remaining
+   occurrences of the old names are three explicit "renamed from
+   `_ColorizeApiBridge`" historical notes (module docstring's "ADDED IN 1004"
+   and "SECOND RESEARCHED-NOT-GUESSED SUBTLETY" sections, and the
+   `_RevitApiBridge` class docstring) — deliberate, not leftover.
+
+2. **Routed the camera-reframe call through the bridge, unconditionally.**
+   `__main__`'s `_on_clash_selection_changed` closure no longer calls
+   `reframe_active_view_on_clash(clash_result, doc, uidoc)` directly. It now
+   defines a zero-arg `_reframe()` closure around that exact call and passes
+   it to `_revit_api_bridge.raise_action(_reframe)` — the same pattern
+   `colorize_checkbox_checked`'s `_apply` closure already uses. This applies
+   to every selection change, including the first, synchronously-fired
+   auto-selection during `ClashListWindow.__init__` (still inside
+   `__main__`) — per the reopen's explicit instruction, there is no
+   special-cased "first call is still valid, skip the bridge" branch; every
+   call goes through the bridge the same way.
+
+3. **Updated documentation that described the old, direct-call wiring** to
+   describe the bridge-routed wiring instead, matching how 1005's colorize
+   docstrings already describe their own bridge usage:
+   - Module docstring: added a "PHASE 7 ROUND 3 FIX" paragraph right after
+     the original "ADDED IN 1004" paragraph, explaining the regression and
+     the fix; generalized the "SECOND RESEARCHED-NOT-GUESSED SUBTLETY"
+     section (originally written colorize-only) to state the same modeless-
+     window/invalid-context constraint applies equally to the selection-
+     changed handler, not just the checkbox handlers.
+   - `reframe_active_view_on_clash`'s own docstring: added a "CALLER'S
+     RESPONSIBILITY - VALID API CONTEXT" paragraph stating the function
+     assumes a valid context and does not establish one itself, and that
+     every call site must queue through the bridge.
+   - `ClashListWindow`'s class docstring: reworded the "EXTENSION HOOK"
+     paragraph to explain that this hook fires outside a valid context like
+     every other handler on this window, and that 1004's `__main__` callback
+     queues through `_revit_api_bridge` rather than calling
+     `reframe_active_view_on_clash` directly. Also dropped a stale
+     "(1005, not yet implemented)" aside left over from before 1005 landed.
+   - `_RevitApiBridge`'s own class docstring: updated to describe itself as
+     shared infrastructure for both 1005's colorize checkbox and 1004's
+     camera-reframe callback, not colorize-only.
+
+4. **Re-verified 1005's colorize behavior is unaffected.** Re-read
+   `colorize_checkbox_checked`, `colorize_checkbox_unchecked`, and
+   `_clear_colorize_if_active` after the rename: both `raise_action` call
+   sites correctly reference the renamed `_revit_api_bridge` instance, the
+   queued `_apply`/`_clear` closures and all surrounding logic (override
+   computation, `previous_overrides` bookkeeping, the synchronous
+   `colorize_active`/`colorize_view_id` reset in
+   `_clear_colorize_if_active`, the `forms.alert` + checkbox-uncheck failure
+   path) are byte-for-byte unchanged apart from the identifier rename. No
+   other behavior was touched.
+
+5. **Verified the "errors still surface" reasoning holds.**
+   `reframe_active_view_on_clash` itself never propagates an exception: it
+   catches `ClashFlagError` around the bounding-box computation and a bare
+   `Exception` around `ZoomAndCenterRectangle`, reporting each via
+   `output.print_md` and returning `False`. Calling it from inside
+   `_RevitApiBridge.Execute()` instead of directly doesn't change that. As a
+   backstop, `Execute()` itself wraps every queued action (including
+   `_reframe`) in its own `try/except Exception` that also reports via
+   `output.print_md` — so even in a hypothetical case where
+   `_combined_host_space_bounding_box` (or something else reframe calls)
+   raised something other than `ClashFlagError`, `Execute()`'s outer handler
+   still catches and reports it rather than letting it escape into Revit's
+   message pump. Confirmed by reading `Execute()`'s implementation directly,
+   not assumed.
+
+Verified with `ast.parse` after edits — no syntax errors introduced. No live
+Revit/pyRevit session available in this sandbox, so the fix (like the rest of
+this ticket) has not been exercised against a real modeless-window navigation
+sequence; the fix directly addresses the specific, independently-confirmed
+`InvalidOperationException` mechanism described in the round-2 reopen, and the
+pattern is identical to 1005's already-reviewed, already-shipped colorize
+bridge usage — not a new, unproven mechanism.
+
+**Reviewer attention:**
+- The perspective-vs-orthographic `ZoomAndCenterRectangle` question from round
+  1 is still open and unrelated to this fix — unchanged, still flagged for
+  ticket 1007's live-model validation.
+- Worth double-checking that `_reframe`'s closure over `clash_result` (a
+  per-call local inside `_on_clash_selection_changed`, not a loop variable)
+  captures the correct value on every call — it does, since each invocation
+  of `_on_clash_selection_changed` creates a fresh `clash_result` binding and
+  a fresh `_reframe` closure over it, so there is no shared-mutable-loop-
+  variable hazard here.
+
+**Label set to `done`:** the rename is confirmed complete via a full-file
+grep (only three clearly-marked historical "renamed from" mentions of the old
+name remain), the camera-reframe call site now matches 1005's already-
+reviewed bridge pattern exactly, 1005's own colorize code was re-read
+post-rename and is behaviorally unchanged, and the error-surfacing reasoning
+was verified against `Execute()`'s actual implementation rather than assumed.
+
+## Phase 7 review round 4: PASS
+
+Independently re-verified, not just re-read the summary: grepped the whole file
+myself for both old and new bridge names (only the three marked historical
+mentions remain), read `_on_clash_selection_changed`'s `_reframe` closure directly
+— correct per-call binding, no loop-variable hazard, routed unconditionally
+through `_revit_api_bridge.raise_action`. Ran `python -m py_compile` myself
+(independent of the implementer's `ast.parse`) — clean. This closes out the
+deepest chain of this test run: a Wayfinder research claim (0004) → reopened a
+detection-method decision (0002) → a class-name bug (1002) → a cross-ticket
+execution-context regression (1004, caught while reviewing 1005) → fixed by
+reusing infrastructure 1005 already built rather than duplicating it. Closing.
+
+**Closed.**

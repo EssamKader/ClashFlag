@@ -109,6 +109,24 @@ the very first clash shown would not trigger a camera move, only subsequent
 Next/Previous/click navigation would, which would contradict US-4 for the
 common case of a run that finds exactly one clash.
 
+PHASE 7 ROUND 3 FIX (1004, reopened during 1005's review): the wiring
+described above originally called ``reframe_active_view_on_clash`` DIRECTLY
+from ``__main__``'s ``selection_changed_callback`` closure. That closure is a
+WPF event handler on a modeless window and, per the "RESEARCHED-NOT-GUESSED
+SUBTLETY" section below (originally written for 1005's colorize checkbox,
+but the exact same constraint), only runs inside a valid Revit API execution
+context for the very first, synchronously-fired auto-selection - every
+subsequent Next/Previous/list-click handler call happens after ``__main__``
+has already returned and would throw
+``Autodesk.Revit.Exceptions.InvalidOperationException`` the moment it
+touched the Revit API. The fix is the same ``ExternalEvent`` bridge 1005
+already built for this - see ``_RevitApiBridge`` below (renamed from
+``_ColorizeApiBridge`` since it is no longer colorize-specific once 1004
+also needs it) - with the camera-reframe call now queued through
+``_revit_api_bridge.raise_action(...)`` UNCONDITIONALLY, including what
+would have been the still-valid first auto-selected clash, rather than
+special-casing "first call is fine, later ones need the bridge."
+
 ADDED IN 1005 (T-5, this revision): colorize-by-category (US-5), via a new
 "Colorize clashes by category" checkbox in ``ClashListWindow`` (see
 ``clashflag_clash_list.xaml``'s ``ColorizeCheckBox``) and its
@@ -184,13 +202,18 @@ override. A console note (`output.print_md`) says so every time colorize is
 turned on, and the checkbox's XAML tooltip says so up front, so this isn't a
 silent gap from the user's point of view.
 
-SECOND RESEARCHED-NOT-GUESSED SUBTLETY: a modeless ``forms.WPFWindow`` (which
+SECOND RESEARCHED-NOT-GUESSED SUBTLETY (originally found via 1005's colorize
+checkbox, later confirmed to equally affect 1004's camera fly-to - see the
+"PHASE 7 ROUND 3 FIX" note above): a modeless ``forms.WPFWindow`` (which
 ``ClashListWindow`` is, per 1003 - see its class docstring) does NOT run its
-later button/checkbox event handlers inside a valid Revit API "execution
-context" - the script's own valid context ends when its ``__main__`` block
-returns, but the window (and its event handlers) keep firing long after
-that. Calling a Revit API method that needs a valid context from one of
-those handlers - most importantly ``Transaction.Start()/Commit()`` - throws
+later button/checkbox/selection-changed event handlers inside a valid Revit
+API "execution context" - the script's own valid context ends when its
+``__main__`` block returns, but the window (and its event handlers) keep
+firing long after that. Calling a Revit API method that needs a valid
+context from one of those handlers - most importantly
+``Transaction.Start()/Commit()``, but equally anything else that touches the
+Revit API at all (e.g. reading ``Document.ActiveView`` or calling
+``UIView.ZoomAndCenterRectangle`` for camera fly-to) - throws
 ``Autodesk.Revit.Exceptions.InvalidOperationException`` ("Starting a
 transaction from an external application running outside of API context is
 not allowed"). This was verified via multiple independent sources (a
@@ -199,15 +222,19 @@ modeless WPFWindow button handler; the general Revit API "External Events"
 developer-guide pattern; and pyRevit's own more recent release notes
 explicitly adding an "external event helper and modeless" example to
 address it) - NOT assumed, because getting this wrong would mean the
-colorize checkbox throws instead of doing anything the very first time it's
-clicked in a real Revit session. The fix is the standard
-``ExternalEvent``/``IExternalEventHandler`` bridge: ``_ColorizeApiBridge``
-(below) is registered once, at module-load time (itself inside a valid API
-context, since that's while this script's command is actively executing -
-required by ``ExternalEvent.Create``'s own contract), and every colorize
-apply/clear operation is queued through it (``raise_action``) instead of
-being called directly from a Checked/Unchecked/Closed handler. Revit invokes
-the queued action back on the main thread, in a valid context, the next time
+colorize checkbox (and, per the round-3 fix, camera fly-to) throws instead
+of doing anything the very first time it's used in a real Revit session
+(colorize) or on the second and later clash navigations (camera fly-to). The
+fix is the standard ``ExternalEvent``/``IExternalEventHandler`` bridge:
+``_RevitApiBridge`` (below; named ``_ColorizeApiBridge`` until the round-3
+fix made it shared infrastructure for 1004 too) is registered once, at
+module-load time (itself inside a valid API context, since that's while
+this script's command is actively executing - required by
+``ExternalEvent.Create``'s own contract), and every colorize apply/clear
+operation AND every camera-reframe call is queued through it
+(``raise_action``) instead of being called directly from a
+Checked/Unchecked/Closed/selection-changed handler. Revit invokes the
+queued action back on the main thread, in a valid context, the next time
 it's idle - which in practice (WPF and Revit's own message pump sharing the
 same UI thread here) is effectively immediate from the user's perspective.
 
@@ -1256,6 +1283,22 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
     US-4 / ticket 1004, equivalent to what Revit's built-in Interference
     Check dialog's "Show" button does for a found clash.
 
+    CALLER'S RESPONSIBILITY - VALID API CONTEXT (Phase 7 round 3 fix): this
+    function itself assumes it is already running inside a valid Revit API
+    execution context - it does not, and cannot, establish one. Every call
+    site (``__main__``'s ``_on_clash_selection_changed`` closure) MUST queue
+    the call through ``_revit_api_bridge.raise_action(...)`` rather than
+    invoking this function directly from a ``ClashListWindow`` selection-
+    changed handler, which runs OUTSIDE a valid context - see the module
+    docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY" section for why.
+    This function's own exception handling (try/except around
+    ``ClashFlagError`` and the general zoom failure, both reported via
+    ``output.print_md`` and returning False rather than propagating) is
+    unaffected by being called from inside ``_RevitApiBridge.Execute()``
+    instead of directly - it never raises out of itself either way, so
+    ``Execute()``'s own outer try/except around each queued action is just a
+    backstop, not something this function relies on.
+
     Returns True if the view was reframed, False if it was skipped (reported
     via ``output.print_md`` - a one-line console note, NOT a modal
     ``forms.alert`` - this runs on every clash-list navigation step, and a
@@ -1375,38 +1418,51 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
 # script's __main__ block finishes executing (and its local variables go out
 # of scope) almost immediately after show_clash_list() returns, while the
 # ---------------------------------------------------------------------------
-# COLORIZE BY CATEGORY (T-5 / ticket 1005)
+# REVIT API BRIDGE (originally built for T-5 / ticket 1005's colorize
+# checkbox; renamed and reused, unchanged in mechanism, for T-4 / ticket
+# 1004's camera fly-to as of the Phase 7 round 3 fix - see the module
+# docstring's "PHASE 7 ROUND 3 FIX" and "SECOND RESEARCHED-NOT-GUESSED
+# SUBTLETY" sections)
 # ---------------------------------------------------------------------------
 #
+# Kept physically next to the "COLORIZE BY CATEGORY" section below (rather
+# than moved elsewhere in the file) since that is still where most of its
+# call sites live; it is no longer colorize-specific in what it does.
+#
 # See the module docstring's "ADDED IN 1005" section for the full research
-# trail on why this only colorizes HOST-side elements, not link-side ones -
+# trail on why colorize only touches HOST-side elements, not link-side ones -
 # short version: there is no supported Revit API to override the graphics of
 # an individual linked-document element, scoped to just that element, from a
 # view in the host document (verified against revitapidocs.com's
 # View.SetElementOverrides / RevitLinkGraphicsSettings docs AND an
 # experienced Autodesk Community answer directly addressing this exact
-# question - not assumed).
+# question - not assumed). That research is unrelated to the bridge itself.
 
-class _ColorizeApiBridge(IExternalEventHandler):
-    """Revit ``ExternalEvent`` bridge back into a valid API context for
-    ``ClashListWindow``'s colorize checkbox handlers - see the module
-    docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY" section for why
-    this is required at all (a modeless WPFWindow's own event handlers run
-    OUTSIDE a valid Revit API context, so calling ``Transaction.Start()``
-    directly from one throws).
+class _RevitApiBridge(IExternalEventHandler):
+    """Revit ``ExternalEvent`` bridge back into a valid API context for any
+    Revit-API-touching work queued from OUTSIDE one - currently
+    ``ClashListWindow``'s colorize checkbox handlers (1005) AND ticket 1004's
+    camera-reframe-on-selection-change callback (as of the Phase 7 round 3
+    fix; originally named ``_ColorizeApiBridge`` and colorize-only before
+    that). See the module docstring's "SECOND RESEARCHED-NOT-GUESSED
+    SUBTLETY" section for why this is required at all (a modeless
+    WPFWindow's own event handlers - including ``ClashListWindow``'s
+    selection-changed handler, not just its checkbox handlers - run OUTSIDE
+    a valid Revit API context, so calling ``Transaction.Start()`` or any
+    other Revit API method directly from one throws).
 
     Usage: call ``raise_action(some_zero_arg_callable)`` from anywhere
     (typically a WPF event handler); Revit invokes that callable back via
     ``Execute()`` at its next idle opportunity, on the main thread, inside a
     valid API context. Actions are queued (a list, not a single slot) so two
-    calls to ``raise_action`` in quick succession - e.g. two separate
-    ``ClashListWindow`` instances from two ClashFlag runs both toggling
-    colorize around the same moment - can't silently overwrite/drop each
-    other; ``Execute()`` drains and runs every queued action, in order, each
-    time Revit calls it.
+    calls to ``raise_action`` in quick succession - e.g. a colorize toggle
+    and a clash-selection change landing around the same moment, or two
+    separate ``ClashListWindow`` instances from two ClashFlag runs both
+    doing so - can't silently overwrite/drop each other; ``Execute()``
+    drains and runs every queued action, in order, each time Revit calls it.
 
     Exactly ONE instance of this class is created, at MODULE LOAD time (see
-    ``_colorize_api_bridge`` below) - required, not incidental:
+    ``_revit_api_bridge`` below) - required, not incidental:
     ``ExternalEvent.Create()`` itself must be called from a valid API
     context, and module load time (this script actively executing as a
     pyRevit command) is exactly that; constructing it lazily from inside a
@@ -1428,19 +1484,22 @@ class _ColorizeApiBridge(IExternalEventHandler):
                 action()
             except Exception as bridge_error:
                 output.print_md(
-                    "_ClashFlag: colorize action failed inside the API-"
+                    "_ClashFlag: a queued action failed inside the API-"
                     "context bridge: {0}_".format(bridge_error)
                 )
 
     def GetName(self):
-        return "ClashFlag - colorize-by-category API bridge"
+        return "ClashFlag - Revit API bridge"
 
 
 # Created once, at module load - see the class docstring for why the timing
 # matters. Held at module scope (like `_open_clash_list_windows`) so it
 # survives past this script's own __main__ returning, for as long as any
-# ClashListWindow it's wired to stays open.
-_colorize_api_bridge = _ColorizeApiBridge()
+# ClashListWindow it's wired to stays open. Shared by both 1005's colorize
+# checkbox handlers and 1004's camera-reframe-on-selection-change callback
+# (as of the Phase 7 round 3 fix) - NOT a separate instance per feature; one
+# bridge, one ExternalEvent, one queue is sufficient and simpler than two.
+_revit_api_bridge = _RevitApiBridge()
 
 
 # Small, hand-picked, mutually-distinguishable palette (ColorBrewer-style
@@ -1690,10 +1749,10 @@ class ClashListWindow(forms.WPFWindow):
     path that ever updates the current clash and fires the extension hook
     below, regardless of how the user triggered the change.
 
-    EXTENSION HOOK for camera fly-to (1004) and colorize (1005, not yet
-    implemented): every time the current clash changes, this window calls
-    ``self.on_selection_changed(clash_result, index)``. To hook in without
-    touching any navigation logic above, EITHER:
+    EXTENSION HOOK for camera fly-to (1004): every time the current clash
+    changes, this window calls ``self.on_selection_changed(clash_result,
+    index)``. To hook in without touching any navigation logic above,
+    EITHER:
       - pass ``selection_changed_callback`` to the constructor (or set
         ``window.selection_changed_callback = your_function`` on an instance
         afterwards - ``on_selection_changed``'s default implementation just
@@ -1703,12 +1762,21 @@ class ClashListWindow(forms.WPFWindow):
     ``your_function(clash_result, index)`` / the override receives the
     ``ClashResult`` now selected and its integer index in
     ``self.clash_results``. Ticket 1004 (camera fly-to, wired from
-    ``__main__``, NOT from inside this class) reads ``clash_result.
-    host_element`` / ``.link_element`` / ``.link_instance_id`` to compute a
-    combined bounding box and reframe the view - see
-    ``reframe_active_view_on_clash`` above. Do NOT reimplement Next/Previous/
-    list-click handling to add new per-selection behavior - hook in here
-    instead so there is only ever one navigation path.
+    ``__main__``, NOT from inside this class) ultimately reads
+    ``clash_result.host_element`` / ``.link_element`` / ``.link_instance_id``
+    to compute a combined bounding box and reframe the view via
+    ``reframe_active_view_on_clash`` above - but IMPORTANT (Phase 7 round 3
+    fix): this hook, like every other ``ClashListWindow`` event handler,
+    fires OUTSIDE a valid Revit API execution context (see the module
+    docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY" section), so
+    ``__main__``'s callback does NOT call ``reframe_active_view_on_clash``
+    directly from here - it queues a closure that does so through
+    ``_revit_api_bridge.raise_action(...)`` instead, the same bridge 1005's
+    colorize checkbox uses, and the actual camera move happens later, back
+    in a valid context, inside ``_RevitApiBridge.Execute()``. Do NOT
+    reimplement Next/Previous/list-click handling to add new per-selection
+    behavior - hook in here instead so there is only ever one navigation
+    path.
 
     Ticket 1005 (colorize-by-category) does NOT use this hook, deliberately:
     per that ticket, colorizing applies to every clash in
@@ -1780,8 +1848,8 @@ class ClashListWindow(forms.WPFWindow):
         Does NOT call ``apply_colorize_overrides`` directly - this handler
         itself runs outside a valid Revit API context (see the module
         docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY"), so the actual
-        work is queued through ``_colorize_api_bridge`` and runs later, back
-        in a valid context, via ``_ColorizeApiBridge.Execute``.
+        work is queued through ``_revit_api_bridge`` and runs later, back
+        in a valid context, via ``_RevitApiBridge.Execute``.
         """
         def _apply():
             active_view = doc.ActiveView
@@ -1815,7 +1883,7 @@ class ClashListWindow(forms.WPFWindow):
                 "so link-side elements are left untouched._"
             )
 
-        _colorize_api_bridge.raise_action(_apply)
+        _revit_api_bridge.raise_action(_apply)
 
     def colorize_checkbox_unchecked(self, sender, args):
         """Turn colorize-by-category OFF: restore every host element this
@@ -1872,7 +1940,7 @@ class ClashListWindow(forms.WPFWindow):
                     "cleared (they went away with the view itself)._"
                 )
 
-        _colorize_api_bridge.raise_action(_clear)
+        _revit_api_bridge.raise_action(_clear)
 
     def _on_list_selection_changed(self, sender, args):
         """The one place ``current_index`` ever changes. Fires for direct
@@ -2137,10 +2205,27 @@ if __name__ == "__main__":
                 # ClashListWindow.__init__'s docstrings for why that ordering
                 # matters). This is wiring only - no navigation logic in
                 # ClashListWindow itself is touched.
+                #
+                # Phase 7 round 3 fix: this callback is a WPF selection-
+                # changed event handler on a modeless window, so - like every
+                # other ClashListWindow handler - it runs OUTSIDE a valid
+                # Revit API execution context on every call except the very
+                # first (synchronous, still-inside-__main__) auto-selection.
+                # Rather than special-case that one still-valid first call,
+                # every call is routed through `_revit_api_bridge.raise_action`
+                # UNCONDITIONALLY, exactly the way `colorize_checkbox_checked`'s
+                # `_apply` closure already does for 1005 - the actual API work
+                # (reading ActiveView, resolving the link, calling
+                # ZoomAndCenterRectangle) happens later, back in a valid
+                # context, inside `_RevitApiBridge.Execute()`.
                 def _on_clash_selection_changed(clash_result, index):
                     if clash_result is None:
                         return
-                    reframe_active_view_on_clash(clash_result, doc, uidoc)
+
+                    def _reframe():
+                        reframe_active_view_on_clash(clash_result, doc, uidoc)
+
+                    _revit_api_bridge.raise_action(_reframe)
 
                 show_clash_list(
                     clash_results,
