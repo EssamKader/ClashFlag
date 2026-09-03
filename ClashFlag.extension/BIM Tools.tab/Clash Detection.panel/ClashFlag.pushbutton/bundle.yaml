@@ -1,0 +1,6 @@
+title: ClashFlag
+tooltip: >-
+  Detect hard clashes between the active model and selected linked models.
+  Pick which categories and loaded links to check, then review results in a
+  navigable list with camera fly-to and optional colorize-by-category.
+author: Essam Kader

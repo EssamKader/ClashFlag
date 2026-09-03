@@ -1,0 +1,6 @@
+{
+    "name": "ClashFlag",
+    "description": "Scoped hard-clash detection between the active model and selected linked models, with a navigable clash list, camera fly-to, and colorize-by-category.",
+    "author": "Essam Kader",
+    "rocket_mode_compatible": true
+}
