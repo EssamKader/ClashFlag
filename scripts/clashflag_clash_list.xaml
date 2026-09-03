@@ -1,0 +1,56 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ClashFlag - Clash List"
+        Height="560" Width="680"
+        MinHeight="320" MinWidth="460"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="CanResizeWithGrip"
+        ShowInTaskbar="True"
+        Topmost="False">
+    <!--
+    T-3 / ticket 1003 clash list / navigation panel (US-3). Loaded via
+    pyrevit.forms.WPFWindow from clashflag_runner.py - see ClashListWindow
+    there.
+
+    No x:Class here, same reasoning as clashflag_scope_picker.xaml: pyRevit's
+    WPFWindow does a XAML-only load into an already-constructed Python
+    object, not a compiled code-behind partial class.
+
+    ClashListBox is deliberately left EMPTY here, same "populate from Python"
+    pattern the scope picker's HostCategoriesStack/LinksStack use: the actual
+    list of clashes is only known once a run has completed, so
+    ClashListWindow.__init__ adds one string item per ClashResult to
+    ClashListBox.Items at construction time.
+
+    Opened with .Show() (modeless), not .ShowDialog() like the scope picker -
+    see ClashListWindow's docstring in clashflag_runner.py for why (US-4
+    camera fly-to, ticket 1004, needs the Revit view interactive while this
+    stays open).
+    -->
+    <Grid Margin="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0"
+                   Text="All clashes found by the last run. Click a row, or use Previous/Next, to step through them one at a time."
+                   TextWrapping="Wrap"
+                   Margin="0,0,0,10"/>
+
+        <ListBox Grid.Row="1" x:Name="ClashListBox" Margin="0,0,0,10"/>
+
+        <TextBlock Grid.Row="2" x:Name="StatusText" Text="" Margin="0,0,0,8" FontWeight="Bold"/>
+
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="PreviousButton" Content="Previous" Width="90" Height="28" Margin="0,0,8,0"
+                    Click="previous_button_click"/>
+            <Button x:Name="NextButton" Content="Next" Width="90" Height="28" Margin="0,0,8,0"
+                    Click="next_button_click"/>
+            <Button x:Name="CloseButton" Content="Close" Width="90" Height="28"
+                    Click="close_button_click"/>
+        </StackPanel>
+    </Grid>
+</Window>

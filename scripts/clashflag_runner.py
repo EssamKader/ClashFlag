@@ -49,15 +49,35 @@ which loaded links to include, per run - not a fixed hardcoded list").
 See the "SCOPE PICKER (T-2 / 1002)" section below for the picker itself, and
 ``run_interference_check``'s new ``ScopeSelection``-based signature.
 
+ADDED IN 1003 (T-3, this revision): a modeless WPF clash list / navigation
+panel (``ClashListWindow`` / ``show_clash_list``), implementing US-3. Per
+tickets/1003-clash-list-panel.md, ``run_interference_check`` now ALSO builds
+one flat, ordered list of ``ClashResult`` objects across every selected link
+(previously the per-link ``clashing_pairs`` lists were only ever printed to
+the console and then discarded - there was nowhere a caller could get "all
+clashes from this run" as a single sequence to hand to a list UI). The
+existing per-link/per-pair console reporting is kept as-is alongside the new
+flat list (not removed) - see the "CLASH LIST PANEL" section below for why.
+``ClashListWindow`` is modeless (``.Show()``, not ``.ShowDialog()`` like the
+T-2 scope picker) because per US-4 (camera fly-to, ticket 1004 - NOT
+implemented here) the user needs to keep interacting with the Revit view
+while this panel stays open and they step through clashes one at a time; a
+modal window would block that. It exposes a documented extension hook
+(``on_selection_changed`` / ``selection_changed_callback``) for tickets 1004
+and 1005 to attach camera-navigation and colorize-by-category behavior to,
+respectively - neither is implemented in this file.
+
 Deliberately still out of scope (see specs/clash-flag.md "out of scope" +
-tickets/1003+):
+tickets/1004-1005):
     - No tolerance / near-miss ("soft clash") logic - hard (real, non-zero-
       volume intersection) clashes only. The small epsilons used below exist
       ONLY to absorb floating-point noise (e.g. two solids that share a face
       exactly) - they are not a clearance/tolerance feature and are not
       user-configurable.
-    - No clash list navigation, camera fly-to, or colorize-by-category
-      (later US-3/4/5, tickets 1003-1005).
+    - No camera auto-fly-to-clash or colorize-by-category (later US-4/5,
+      tickets 1004-1005) - ``ClashListWindow`` provides the navigation hook
+      those tickets need, but does not itself move the camera or touch
+      element graphics overrides.
     - pyRevit pushbutton/bundle packaging (ticket 1006) - this is still a
       flat, directly-run script.
 
@@ -845,12 +865,237 @@ def show_scope_picker(host_doc):
     return picker.result if picker.confirmed else None
 
 
+# ---------------------------------------------------------------------------
+# CLASH LIST PANEL (T-3 / ticket 1003)
+# ---------------------------------------------------------------------------
+
+class ClashResult(object):
+    """One confirmed clash pair, flattened for the T-3 list panel.
+
+    A single ClashFlag run can check the host against several distinct
+    selected links (``ScopeSelection.link_selections``), and until this
+    ticket each link's ``clashing_pairs`` only ever existed as a local list
+    inside ``run_interference_check``'s loop body, printed to the console and
+    then discarded - there was nowhere a single ordered sequence of "every
+    clash from this run" lived for a UI to display/navigate. ``ClashResult``
+    plus the flat list built in ``run_interference_check`` fills that gap.
+
+    Fields:
+    - host_element: the clashing ``Element`` from the active (host) document.
+    - link_element: the clashing ``Element`` from the LINKED document, in
+      whatever state ``find_clashing_pairs`` returned it in - this class only
+      carries it for display/navigation (``describe_element``), it does not
+      re-derive or store any transformed geometry.
+    - link_name: display name (``_link_display_name``) of the
+      ``RevitLinkInstance`` this pair was found against. Carried alongside
+      the pair (rather than assumed) because a single run can check multiple
+      distinct links, so the panel needs to say which link each row came
+      from - the pair alone (two Elements) doesn't disambiguate that once
+      flattened across links.
+    """
+
+    def __init__(self, host_element, link_element, link_name):
+        self.host_element = host_element
+        self.link_element = link_element
+        self.link_name = link_name
+
+    def describe(self):
+        """One-line display string for this clash, used as a ListBox row in
+        ClashListWindow. Reuses describe_element() for both sides, same as
+        the existing per-link console reporting below, so the panel and the
+        console output describe elements identically."""
+        return "Host: {0}   <->   Link [{1}]: {2}".format(
+            describe_element(self.host_element),
+            self.link_name,
+            describe_element(self.link_element),
+        )
+
+
+# Kept alive here purely to prevent .NET/CLR garbage collection of an open
+# ClashListWindow. Unlike ScopePickerWindow (opened with the blocking
+# ShowDialog(), which keeps its own frame alive on the call stack until
+# closed), ClashListWindow is opened with the non-blocking Show() - the
+# script's __main__ block finishes executing (and its local variables go out
+# of scope) almost immediately after show_clash_list() returns, while the
+# window itself is still meant to stay open. Without holding a reference
+# somewhere that survives past script end, the window object would become
+# eligible for collection and could disappear/misbehave out from under the
+# user. Entries remove themselves on Closed (see show_clash_list) so this
+# doesn't grow unbounded across repeated runs in the same pyRevit session.
+_open_clash_list_windows = []
+
+
+class ClashListWindow(forms.WPFWindow):
+    """Modeless T-3 clash list / navigation panel (US-3).
+
+    Modeless (opened via ``.Show()``, not ``.ShowDialog()`` like
+    ScopePickerWindow) specifically because - per US-4 (camera auto-navigation,
+    ticket 1004, NOT implemented here) - the user is expected to keep looking
+    at and interacting with the active Revit 3D view WHILE stepping through
+    clashes in this panel. A modal window would block the Revit UI thread and
+    make that impossible, which is exactly the reason ScopePickerWindow (T-2)
+    is modal and this one deliberately is not.
+
+    Navigation model: ``self.current_index`` is the single source of truth for
+    "which clash is currently selected". Both direct list clicks
+    (``ClashListBox``'s ``SelectionChanged``) and the Next/Previous buttons
+    ultimately change ``ClashListBox.SelectedIndex``, which is the only thing
+    ``_on_list_selection_changed`` listens to - so there is exactly one code
+    path that ever updates the current clash and fires the extension hook
+    below, regardless of how the user triggered the change.
+
+    EXTENSION HOOK for future tickets (1004 camera fly-to, 1005 colorize):
+    every time the current clash changes, this window calls
+    ``self.on_selection_changed(clash_result, index)``. To hook in without
+    touching any navigation logic above, EITHER:
+      - set ``window.selection_changed_callback = your_function`` on an
+        instance (``on_selection_changed``'s default implementation just
+        forwards to this callback if one is set, otherwise it's a no-op), OR
+      - subclass ``ClashListWindow`` and override ``on_selection_changed``
+        directly.
+    ``your_function(clash_result, index)`` / the override receives the
+    ``ClashResult`` now selected and its integer index in
+    ``self.clash_results`` - ticket 1004 would read ``clash_result.host_element``
+    / ``.link_element`` to compute a combined bounding box and reframe the
+    view; ticket 1005 would use the category pair off those same two elements
+    to pick an ``OverrideGraphicSettings`` color. Neither is implemented here.
+    Do NOT reimplement Next/Previous/list-click handling to add that behavior
+    - hook in here instead so there is only ever one navigation path.
+    """
+
+    def __init__(self, xaml_file_path, clash_results):
+        forms.WPFWindow.__init__(self, xaml_file_path)
+
+        self.clash_results = list(clash_results)
+        self.current_index = -1
+
+        # Extension point for tickets 1004/1005 - see class docstring. None
+        # means "no callback attached"; on_selection_changed() below no-ops
+        # in that case.
+        self.selection_changed_callback = None
+
+        for clash_result in self.clash_results:
+            self.ClashListBox.Items.Add(clash_result.describe())
+
+        self.ClashListBox.SelectionChanged += self._on_list_selection_changed
+
+        if self.clash_results:
+            self._set_current_index(0)
+        else:
+            self._update_status_and_buttons()
+
+    def _on_list_selection_changed(self, sender, args):
+        """The one place ``current_index`` ever changes. Fires for direct
+        user clicks on a list row AND for the ``SelectedIndex`` writes
+        ``_set_current_index()`` itself makes (Next/Previous/initial
+        selection) - both paths converge here on purpose."""
+        selected_index = self.ClashListBox.SelectedIndex
+        if selected_index == self.current_index:
+            return
+        self.current_index = selected_index
+        self._update_status_and_buttons()
+        self._fire_selection_hook()
+
+    def _set_current_index(self, new_index):
+        """Move the current-clash pointer to `new_index`, clamped to the
+        valid range. Setting ``SelectedIndex`` (rather than updating
+        ``self.current_index`` directly) routes the change back through
+        ``_on_list_selection_changed`` above, keeping list-click and
+        button-driven navigation on the exact same code path."""
+        if not self.clash_results:
+            return
+        clamped_index = max(0, min(new_index, len(self.clash_results) - 1))
+        self.ClashListBox.SelectedIndex = clamped_index
+
+    def _update_status_and_buttons(self):
+        total = len(self.clash_results)
+        if 0 <= self.current_index < total:
+            self.StatusText.Text = "Clash {0} of {1}".format(
+                self.current_index + 1, total
+            )
+        else:
+            self.StatusText.Text = "No clashes." if total == 0 else ""
+        self.PreviousButton.IsEnabled = self.current_index > 0
+        self.NextButton.IsEnabled = 0 <= self.current_index < total - 1
+
+    def _fire_selection_hook(self):
+        clash_result = None
+        if 0 <= self.current_index < len(self.clash_results):
+            clash_result = self.clash_results[self.current_index]
+        self.on_selection_changed(clash_result, self.current_index)
+
+    def on_selection_changed(self, clash_result, index):
+        """EXTENSION HOOK - see class docstring for the full contract. Called
+        every time the current-clash pointer changes, with the newly current
+        ``ClashResult`` (or ``None``/``-1`` if nothing is selected) and its
+        index. Default implementation forwards to
+        ``self.selection_changed_callback`` if one has been set; override
+        this method in a subclass instead if you'd rather extend by
+        inheritance. Tickets 1004 (camera fly-to) and 1005 (colorize) should
+        each hook in here."""
+        if self.selection_changed_callback is not None:
+            self.selection_changed_callback(clash_result, index)
+
+    def next_button_click(self, sender, args):
+        self._set_current_index(self.current_index + 1)
+
+    def previous_button_click(self, sender, args):
+        self._set_current_index(self.current_index - 1)
+
+    def close_button_click(self, sender, args):
+        self.Close()
+
+
+def show_clash_list(clash_results):
+    """Show the modeless T-3 clash list window for `clash_results` (expected
+    non-empty - see run_interference_check's caller in __main__, which skips
+    calling this at all when a run finds zero clashes rather than opening an
+    empty panel).
+
+    Returns the ``ClashListWindow`` instance. The caller doesn't need to keep
+    it (a module-level list keeps it alive - see ``_open_clash_list_windows``
+    above) but a future ticket wiring up 1004/1005 may want the reference to
+    set ``selection_changed_callback`` on it, or on a subclass instance
+    constructed in its place.
+    """
+    xaml_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "clashflag_clash_list.xaml"
+    )
+    window = ClashListWindow(xaml_path, clash_results)
+
+    _open_clash_list_windows.append(window)
+
+    def _forget_window(sender, args):
+        if window in _open_clash_list_windows:
+            _open_clash_list_windows.remove(window)
+
+    window.Closed += _forget_window
+
+    window.Show()
+    return window
+
+
 def run_interference_check(scope_selection):
     """Run the manual-transform interference check for one user-picked scope:
     `scope_selection.host_categories` against the active document, checked
     separately against each selected linked model in
     `scope_selection.link_selections` (each with its own category subset and
     its own placement transform).
+
+    Returns a flat, ordered ``list[ClashResult]`` covering every clash found
+    across every selected link, in the same order the links were iterated and
+    (within a link) the same order ``find_clashing_pairs`` returned them -
+    this is the single sequence the T-3 list panel (``ClashListWindow``) is
+    built to display/navigate. The list is empty (never ``None``) when no
+    clashes were found anywhere, so a caller can just check truthiness.
+
+    The existing per-link/per-pair ``output.print_md`` console reporting
+    below is UNCHANGED and kept alongside this - it's not made redundant by
+    the flat list because it's grouped and labeled per-link (with candidate
+    counts, skip counts, and a per-link sub-total) in a way a single flat
+    list intentionally is not; the console output is a run LOG, the flat list
+    is UI-navigation STATE. Both are cheap to keep since they're built from
+    the same already-computed ``clashing_pairs`` values.
     """
     output.print_md("## ClashFlag - interference check runner")
     output.print_md(
@@ -881,9 +1126,12 @@ def run_interference_check(scope_selection):
             "**No interferences found** - the host side has zero candidates "
             "with usable solid geometry, so no pair can be checked."
         )
-        return
+        return []
 
     total_clash_count = 0
+    all_clash_results = []  # flat list[ClashResult] across every link - see
+    # this function's docstring for why this is built alongside, not instead
+    # of, the per-link console reporting below.
 
     for link_element_id, link_categories in scope_selection.link_selections:
         link_instance = resolve_link_instance_by_id(doc, link_element_id)
@@ -950,6 +1198,7 @@ def run_interference_check(scope_selection):
                     describe_element(element2),
                 )
             )
+            all_clash_results.append(ClashResult(element1, element2, link_name))
 
     output.print_md("---")
     output.print_md(
@@ -958,6 +1207,8 @@ def run_interference_check(scope_selection):
         )
     )
 
+    return all_clash_results
+
 
 if __name__ == "__main__":
     try:
@@ -965,7 +1216,15 @@ if __name__ == "__main__":
         if scope_selection is None:
             output.print_md("ClashFlag - cancelled (no scope confirmed).")
         else:
-            run_interference_check(scope_selection)
+            clash_results = run_interference_check(scope_selection)
+            # Only open the T-3 list panel when there's something to
+            # navigate - run_interference_check's own console reporting
+            # above already covers the "no clashes" case (per-link and via
+            # the final "Total: 0 clash pair(s)" line), so an empty panel
+            # would be redundant and confusing (per ticket 1003 instruction
+            # #5: don't show an empty panel for a zero-clash run).
+            if clash_results:
+                show_clash_list(clash_results)
     except ClashFlagError as clash_flag_error:
         # Expected, actionable setup problem (e.g. a link unloaded since the
         # picker was shown) - show the user a clear message instead of a raw
