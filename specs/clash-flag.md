@@ -30,7 +30,7 @@ As a BIM engineer, I want all detected clashes to appear in a list I can step th
 As a BIM engineer, I want the 3D view to automatically reframe on the two clashing elements when I select a clash from the list, so that I don't have to manually hunt for and zoom to each clash location.
 
 **US-5 — Colorize by category**
-As a BIM engineer, I want an option to color-code clashing elements by their category/discipline pair (e.g. MEP-vs-Structural vs. MEP-vs-MEP) directly in the view, so that I can visually triage clash types at a glance across the whole model.
+As a BIM engineer, I want an option to color-code the host-side clashing elements by their category/discipline pair (e.g. MEP-vs-Structural vs. MEP-vs-MEP) directly in the view, so that I can visually triage clash types at a glance across the whole model. (Revised after Phase 7 review of ticket 1005: Revit's API — and its own native UI — has no mechanism to override an individual linked element's graphics from the host view, so only the host-side element of each clash is colorized. This matches Revit's own capability ceiling, not a regression.)
 
 **US-6 — Fits existing workflow**
 As a BIM engineer, I want ClashFlag delivered as a pyRevit pushbutton, so that it installs and runs the same way as the rest of my pyRevit toolkit, with no separate compiled add-in to deploy.

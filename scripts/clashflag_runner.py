@@ -109,30 +109,138 @@ the very first clash shown would not trigger a camera move, only subsequent
 Next/Previous/click navigation would, which would contradict US-4 for the
 common case of a run that finds exactly one clash.
 
-Deliberately still out of scope (see specs/clash-flag.md "out of scope" +
-ticket 1005):
+ADDED IN 1005 (T-5, this revision): colorize-by-category (US-5), via a new
+"Colorize clashes by category" checkbox in ``ClashListWindow`` (see
+``clashflag_clash_list.xaml``'s ``ColorizeCheckBox``) and its
+``colorize_checkbox_checked`` / ``colorize_checkbox_unchecked`` handlers,
+NOT the existing per-selection ``on_selection_changed`` hook - per the
+ticket, colorizing is a toggle that applies to every clash in the CURRENT
+``clash_results`` set at once, not a per-selection-change action, so it
+needed its own control rather than piggy-backing on 1004's hook. See the
+"COLORIZE BY CATEGORY (T-5 / ticket 1005)" section below for
+``apply_colorize_overrides`` / ``clear_colorize_overrides`` and the
+category-pair-to-color mapping.
+
+RESEARCHED, NOT GUESSED - IMPORTANT LIMITATION: this ticket's obvious literal
+ask ("apply OverrideGraphicSettings to every host_element AND every
+link_element") turns out to be impossible for the link_element half via any
+supported Revit API, and this was verified rather than assumed before
+writing any of the code below:
+    - ``View.SetElementOverrides(ElementId, OverrideGraphicSettings)`` has
+      exactly one overload (confirmed against revitapidocs.com for both the
+      2022 and 2024 API) - there is no overload accepting a ``LinkElementId``
+      or any other cross-document identifier. Its ``elementId`` parameter
+      must be "a valid Element identifier" IN THE DOCUMENT THE VIEW BELONGS
+      TO (host doc, for the host view this tool uses) - a linked element's
+      own ``ElementId`` is only meaningful inside its own (linked) document,
+      so passing it here would either throw, or - worse - silently apply the
+      override to an unrelated HOST element that happens to reuse the same
+      integer id.
+    - ``LinkElementId`` IS a real Revit API class/struct (pairs a host-side
+      link-instance id with a linked element's id), but it is used for
+      selection/reference/tagging APIs (e.g. picking or tagging an element
+      inside a link) - NOT for graphic overrides. No override-related method
+      anywhere in the API accepts one.
+    - The only link-scoped graphic-override API is
+      ``View.SetLinkOverrides(ElementId linkId, RevitLinkGraphicsSettings)``
+      (new in Revit 2024, confirmed via revitapidocs.com's
+      ``RevitLinkGraphicsSettings`` member list) - but that overrides the
+      ENTIRE link's display (halftone/by-linked-view/etc, via
+      ``LinkVisibilityType`` + ``LinkedViewId``), with no per-element or
+      even per-category override surface exposed on the class itself.
+    - Confirmed independently by a detailed, specific answer from an
+      experienced Autodesk Community "Mentor" (RPTHOMAS108) to the exact
+      question "can you override linked element graphics by element from
+      the host view, via API": *"Override linked element graphics by
+      element in view: No ... The API methods that override colour by
+      element take an ElementId that must be contained in the document
+      where the view exists ... I believe none of these things are
+      currently possible in API."* - matching the UI limitation too (Revit's
+      own Visibility/Graphics dialog can't do per-element overrides of
+      linked elements either, only per-category or hide-entirely).
+    - The only way to make an individual linked element's own graphics
+      differ in the host view at all is to open/reuse a VIEW OF THE LINKED
+      DOCUMENT ITSELF, call ``SetElementOverrides`` there (valid, since that
+      view and that element share a document), and then point the host's
+      ``RevitLinkGraphicsSettings`` at that view via
+      ``LinkVisibilityType.ByLinkView`` - i.e. write to and depend on a
+      persisted view inside a SEPARATE (possibly shared/worked-shared) .rvt
+      file, and change the host view's link display mode away from its
+      default "by host view" for that whole link (affecting everything about
+      how that link displays in this view, not just the clash elements).
+      That's a materially more invasive, longer-lived, foreign-document-
+      mutating design than a lightweight visualization toggle should be
+      doing, and is NOT what this ticket's "toggle on/off, clears on close"
+      framing describes - so it was not implemented. See
+      ``apply_colorize_overrides``'s docstring and
+      tickets/1005-colorize-by-category.md's Implementation section for the
+      full writeup and the open design question this leaves for a reviewer/
+      spec-owner to weigh in on.
+
+Given the above, this revision colorizes ONLY the HOST-SIDE element of each
+clash by its (host category, link category) pair - genuinely correct,
+transacted, and toggle-safe - and does NOT attempt any link-side element
+override. A console note (`output.print_md`) says so every time colorize is
+turned on, and the checkbox's XAML tooltip says so up front, so this isn't a
+silent gap from the user's point of view.
+
+SECOND RESEARCHED-NOT-GUESSED SUBTLETY: a modeless ``forms.WPFWindow`` (which
+``ClashListWindow`` is, per 1003 - see its class docstring) does NOT run its
+later button/checkbox event handlers inside a valid Revit API "execution
+context" - the script's own valid context ends when its ``__main__`` block
+returns, but the window (and its event handlers) keep firing long after
+that. Calling a Revit API method that needs a valid context from one of
+those handlers - most importantly ``Transaction.Start()/Commit()`` - throws
+``Autodesk.Revit.Exceptions.InvalidOperationException`` ("Starting a
+transaction from an external application running outside of API context is
+not allowed"). This was verified via multiple independent sources (a
+pyRevit-specific worked example hitting exactly this exception from a
+modeless WPFWindow button handler; the general Revit API "External Events"
+developer-guide pattern; and pyRevit's own more recent release notes
+explicitly adding an "external event helper and modeless" example to
+address it) - NOT assumed, because getting this wrong would mean the
+colorize checkbox throws instead of doing anything the very first time it's
+clicked in a real Revit session. The fix is the standard
+``ExternalEvent``/``IExternalEventHandler`` bridge: ``_ColorizeApiBridge``
+(below) is registered once, at module-load time (itself inside a valid API
+context, since that's while this script's command is actively executing -
+required by ``ExternalEvent.Create``'s own contract), and every colorize
+apply/clear operation is queued through it (``raise_action``) instead of
+being called directly from a Checked/Unchecked/Closed handler. Revit invokes
+the queued action back on the main thread, in a valid context, the next time
+it's idle - which in practice (WPF and Revit's own message pump sharing the
+same UI thread here) is effectively immediate from the user's perspective.
+
+Deliberately still out of scope (see specs/clash-flag.md "out of scope"):
     - No tolerance / near-miss ("soft clash") logic - hard (real, non-zero-
       volume intersection) clashes only. The small epsilons used below exist
       ONLY to absorb floating-point noise (e.g. two solids that share a face
       exactly) - they are not a clearance/tolerance feature and are not
       user-configurable.
-    - No colorize-by-category (later US-5, ticket 1005) - ``ClashListWindow``
-      provides the same navigation hook 1005 needs, but this file does not
-      touch element graphics overrides.
     - pyRevit pushbutton/bundle packaging (ticket 1006) - this is still a
       flat, directly-run script.
 
-This script is READ-ONLY against the model: everything below only *reads*
-geometry (FilteredElementCollector, Element.get_Geometry) or computes
-transient, in-memory results (SolidUtils.CreateTransformed,
-BooleanOperationsUtils.ExecuteBooleanOperation) - none of it creates, deletes,
-or modifies any element or parameter in either document, and the scope
-picker only reads UI state - no Transaction is opened anywhere in this file.
-Per project ground rules ("Revit API code always wraps mutating operations in
-a Transaction"), that's correct as long as nothing here starts writing to the
-model - if a future ticket adds anything that writes (e.g. tagging clash
-locations, storing results in a project parameter), THAT code must open its
-own Transaction around just the mutating calls.
+Detection and navigation (everything above the "COLORIZE BY CATEGORY"
+section) remain READ-ONLY against the model: they only *read* geometry
+(FilteredElementCollector, Element.get_Geometry) or compute transient,
+in-memory results (SolidUtils.CreateTransformed,
+BooleanOperationsUtils.ExecuteBooleanOperation) or transient view pan/zoom
+state (``UIView.ZoomAndCenterRectangle`` - not a persisted view property, see
+``reframe_active_view_on_clash``'s own docstring) - none of that creates,
+deletes, or modifies any element, parameter, or persisted view property, and
+the scope picker only reads UI state, so no Transaction is needed for any of
+it.
+
+1005's colorize-by-category feature is the FIRST thing in this file that
+actually mutates persisted state: ``View.SetElementOverrides`` writes a
+persisted, transacted graphic-override property of the view. Per project
+ground rules ("Revit API code always wraps mutating operations in a
+Transaction, always handles exceptions"), ``apply_colorize_overrides`` and
+``clear_colorize_overrides`` (see the "COLORIZE BY CATEGORY" section) each
+open their own single, descriptively-named ``Transaction`` around exactly
+their batch of ``SetElementOverrides`` calls, with a try/except around the
+whole batch that rolls back on failure rather than leaving a half-applied
+transaction open.
 """
 
 import os
@@ -150,18 +258,24 @@ from Autodesk.Revit.DB import (
     BooleanOperationsType,
     BuiltInCategory,
     CategoryType,
+    Color,
+    ElementId,
     ElementMulticategoryFilter,
+    FillPatternElement,
     FilteredElementCollector,
     GeometryInstance,
     Options,
     Outline,
+    OverrideGraphicSettings,
     RevitLinkInstance,
     Solid,
     SolidUtils,
+    Transaction,
     View3D,
     ViewDetailLevel,
     XYZ,
 )
+from Autodesk.Revit.UI import ExternalEvent, IExternalEventHandler
 from System.Collections.Generic import List
 from System.Windows import FontStyles, FontWeights, TextWrapping, Thickness
 from System.Windows.Controls import CheckBox, StackPanel, TextBlock
@@ -1260,6 +1374,295 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
 # closed), ClashListWindow is opened with the non-blocking Show() - the
 # script's __main__ block finishes executing (and its local variables go out
 # of scope) almost immediately after show_clash_list() returns, while the
+# ---------------------------------------------------------------------------
+# COLORIZE BY CATEGORY (T-5 / ticket 1005)
+# ---------------------------------------------------------------------------
+#
+# See the module docstring's "ADDED IN 1005" section for the full research
+# trail on why this only colorizes HOST-side elements, not link-side ones -
+# short version: there is no supported Revit API to override the graphics of
+# an individual linked-document element, scoped to just that element, from a
+# view in the host document (verified against revitapidocs.com's
+# View.SetElementOverrides / RevitLinkGraphicsSettings docs AND an
+# experienced Autodesk Community answer directly addressing this exact
+# question - not assumed).
+
+class _ColorizeApiBridge(IExternalEventHandler):
+    """Revit ``ExternalEvent`` bridge back into a valid API context for
+    ``ClashListWindow``'s colorize checkbox handlers - see the module
+    docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY" section for why
+    this is required at all (a modeless WPFWindow's own event handlers run
+    OUTSIDE a valid Revit API context, so calling ``Transaction.Start()``
+    directly from one throws).
+
+    Usage: call ``raise_action(some_zero_arg_callable)`` from anywhere
+    (typically a WPF event handler); Revit invokes that callable back via
+    ``Execute()`` at its next idle opportunity, on the main thread, inside a
+    valid API context. Actions are queued (a list, not a single slot) so two
+    calls to ``raise_action`` in quick succession - e.g. two separate
+    ``ClashListWindow`` instances from two ClashFlag runs both toggling
+    colorize around the same moment - can't silently overwrite/drop each
+    other; ``Execute()`` drains and runs every queued action, in order, each
+    time Revit calls it.
+
+    Exactly ONE instance of this class is created, at MODULE LOAD time (see
+    ``_colorize_api_bridge`` below) - required, not incidental:
+    ``ExternalEvent.Create()`` itself must be called from a valid API
+    context, and module load time (this script actively executing as a
+    pyRevit command) is exactly that; constructing it lazily from inside a
+    later, invalid-context event handler would defeat the whole point.
+    """
+
+    def __init__(self):
+        self._pending_actions = []
+        self.external_event = ExternalEvent.Create(self)
+
+    def raise_action(self, action):
+        self._pending_actions.append(action)
+        self.external_event.Raise()
+
+    def Execute(self, uiapp):
+        pending_actions, self._pending_actions = self._pending_actions, []
+        for action in pending_actions:
+            try:
+                action()
+            except Exception as bridge_error:
+                output.print_md(
+                    "_ClashFlag: colorize action failed inside the API-"
+                    "context bridge: {0}_".format(bridge_error)
+                )
+
+    def GetName(self):
+        return "ClashFlag - colorize-by-category API bridge"
+
+
+# Created once, at module load - see the class docstring for why the timing
+# matters. Held at module scope (like `_open_clash_list_windows`) so it
+# survives past this script's own __main__ returning, for as long as any
+# ClashListWindow it's wired to stays open.
+_colorize_api_bridge = _ColorizeApiBridge()
+
+
+# Small, hand-picked, mutually-distinguishable palette (ColorBrewer-style
+# "qualitative" hues - deliberately not randomly generated, so adjacent
+# entries never land on near-duplicate colors) cycled across every distinct
+# (host_category, link_category) pair seen in the current clash_results.
+_CATEGORY_PAIR_COLOR_PALETTE = [
+    Color(228, 26, 28),    # red
+    Color(55, 126, 184),   # blue
+    Color(77, 175, 74),    # green
+    Color(255, 127, 0),    # orange
+    Color(152, 78, 163),   # purple
+    Color(255, 255, 51),   # yellow
+    Color(166, 86, 40),    # brown
+    Color(247, 129, 191),  # pink
+    Color(153, 153, 153),  # gray
+    Color(0, 128, 128),    # teal
+]
+
+
+def _category_name_for_colorize(element):
+    """Category display name used as one half of a colorize pair key - same
+    "<no category>" fallback text describe_element() uses, so an element
+    without a Category still gets a deterministic, groupable key instead of
+    raising."""
+    if element.Category is not None:
+        return element.Category.Name
+    return "<no category>"
+
+
+def _category_pair_key(clash_result):
+    """Stable dict key for one clash's (host category, link category) pair.
+    Host and link names are kept in their natural (host, link) order rather
+    than order-normalized/sorted against each other - within a single
+    ClashFlag run a given category never swaps which side it's found on, so
+    this is already consistent, and "Host: Structural Framing <-> Link:
+    Duct" reads more naturally than an alphabetically-normalized pair would.
+    """
+    return (
+        _category_name_for_colorize(clash_result.host_element),
+        _category_name_for_colorize(clash_result.link_element),
+    )
+
+
+def _build_category_pair_color_map(clash_results):
+    """Deterministic (host_category, link_category) -> Color map, stable
+    across repeated calls for the SAME clash_results CONTENT regardless of
+    the ORDER those results happen to be in.
+
+    Distinct pairs are collected into a set and then sorted alphabetically
+    before being zipped against the fixed palette by position - so the
+    mapping depends only on WHICH pairs are present, never on the order
+    run_interference_check/find_clashing_pairs happened to produce them in.
+    Colors cycle (modulo) once there are more distinct pairs than palette
+    entries - beyond _CATEGORY_PAIR_COLOR_PALETTE's length, some pairs will
+    share a color. That's an acceptable degradation (still internally
+    consistent per pair within one colorize toggle) rather than a hard cap
+    on how many distinct pairs can be colorized at once.
+    """
+    distinct_pairs = sorted(set(_category_pair_key(cr) for cr in clash_results))
+    return {
+        pair: _CATEGORY_PAIR_COLOR_PALETTE[index % len(_CATEGORY_PAIR_COLOR_PALETTE)]
+        for index, pair in enumerate(distinct_pairs)
+    }
+
+
+def _find_solid_fill_pattern_id(host_doc):
+    """Return the ElementId of a solid DRAFTING fill pattern in `host_doc`,
+    or None if one can't be found. Every out-of-the-box Revit template ships
+    one ("<Solid fill>"), but a deliberately stripped-down project template
+    might not - callers must tolerate None (skip the surface-pattern half of
+    the override, keep the line-color half) rather than assume this always
+    succeeds.
+    """
+    for fill_pattern_element in FilteredElementCollector(host_doc).OfClass(FillPatternElement):
+        try:
+            fill_pattern = fill_pattern_element.GetFillPattern()
+        except Exception:
+            continue
+        if fill_pattern is not None and fill_pattern.IsSolidFill:
+            return fill_pattern_element.Id
+    return None
+
+
+def _colorize_settings_for(color, solid_fill_pattern_id):
+    """Build one OverrideGraphicSettings that renders as `color` regardless
+    of the active view's visual style.
+
+    Sets BOTH the projection/cut line color (the only thing visible in a
+    Wireframe or Hidden Line view style) AND the surface+cut foreground
+    pattern (a solid fill in `color`, when a solid pattern was found - the
+    dominant visual in a Shaded/Realistic view style, where a shaded solid's
+    rendered face color would otherwise drown out a thin projection line).
+    Camera fly-to (1004) reframes on a 3D view, which is commonly Shaded or
+    Realistic, so relying on line color alone would make this toggle look
+    like it did nothing for most users.
+    """
+    settings = OverrideGraphicSettings()
+    settings.SetProjectionLineColor(color)
+    settings.SetCutLineColor(color)
+    if solid_fill_pattern_id is not None:
+        settings.SetSurfaceForegroundPatternColor(color)
+        settings.SetSurfaceForegroundPatternId(solid_fill_pattern_id)
+        settings.SetCutForegroundPatternColor(color)
+        settings.SetCutForegroundPatternId(solid_fill_pattern_id)
+    return settings
+
+
+def apply_colorize_overrides(clash_results, host_doc, active_view):
+    """Apply a per-(host_category, link_category)-pair color override to
+    every HOST-SIDE element across `clash_results`, in `active_view`. See
+    this module's "COLORIZE BY CATEGORY" section header comment (and the
+    module docstring's "ADDED IN 1005" section) for why link-side elements
+    are deliberately NOT touched here.
+
+    Returns a dict {ElementId.IntegerValue: OverrideGraphicSettings} - the
+    PRE-EXISTING override for every host element this call touches, captured
+    via `active_view.GetElementOverrides(...)` BEFORE this function changes
+    anything. `clear_colorize_overrides` uses this to restore exactly what
+    was there before, rather than blanket-clearing every override on these
+    elements - so a manual override the user had already set up on one of
+    these elements (before ever touching the ClashFlag colorize checkbox)
+    survives a colorize on/off cycle intact. Keyed by `ElementId.
+    IntegerValue` (a plain int) rather than the ElementId object itself so
+    the result is a plain, unambiguously-hashable dict.
+
+    A single host element can appear in more than one ClashResult (e.g. one
+    beam clashing against two different linked ducts) - its pre-colorize
+    override is captured only the FIRST time it's encountered here, so a
+    later ClashResult for the same element doesn't wrongly "snapshot" this
+    function's own already-applied override as if it were the user's
+    original one. Re-applying an override to the same element more than once
+    is harmless - whichever ClashResult for it is processed last simply
+    determines its final color.
+
+    Opens exactly one Transaction ("ClashFlag: colorize by category") for
+    the whole batch - a single logical user action ("turn colorize on"), not
+    one transaction per element - with the whole loop wrapped in a
+    try/except that rolls back on any failure rather than leaving a half-
+    applied transaction open, per project ground rules.
+    """
+    color_map = _build_category_pair_color_map(clash_results)
+    solid_fill_pattern_id = _find_solid_fill_pattern_id(host_doc)
+
+    previous_overrides = {}
+
+    transaction = Transaction(host_doc, "ClashFlag: colorize by category")
+    transaction.Start()
+    try:
+        for clash_result in clash_results:
+            host_element = clash_result.host_element
+            id_key = host_element.Id.IntegerValue
+
+            if id_key not in previous_overrides:
+                previous_overrides[id_key] = active_view.GetElementOverrides(host_element.Id)
+
+            pair_color = color_map[_category_pair_key(clash_result)]
+            active_view.SetElementOverrides(
+                host_element.Id,
+                _colorize_settings_for(pair_color, solid_fill_pattern_id),
+            )
+    except Exception:
+        transaction.RollBack()
+        raise
+    else:
+        transaction.Commit()
+
+    return previous_overrides
+
+
+def clear_colorize_overrides(host_doc, view, previous_overrides):
+    """Restore every host element touched by `apply_colorize_overrides` back
+    to whatever `OverrideGraphicSettings` it had immediately before colorize
+    was turned on (`previous_overrides`, keyed by `ElementId.IntegerValue` -
+    see that function's docstring) - NOT a blanket "remove all overrides",
+    so a pre-existing manual override on one of these elements survives a
+    colorize on/off cycle. Elements never touched by colorize are never
+    referenced here at all, so unrelated overrides elsewhere in the view
+    (anything the user set up themselves, outside ClashFlag) are untouched
+    by construction.
+
+    `view` MUST be the same View instance/id that `apply_colorize_overrides`
+    was called against, not necessarily whatever is active NOW - overrides
+    are per-view state, so clearing on a different view than the one that
+    was actually colorized would both fail to clean up the real target and
+    risk stamping an unrelated view with a stale snapshot. Callers
+    (`ClashListWindow.colorize_checkbox_unchecked`, and the Closed-event
+    cleanup in `show_clash_list`) are responsible for remembering which view
+    id colorize was applied to and re-resolving that exact View here - see
+    those call sites.
+
+    Silently skips (does not raise) an id that can no longer be resolved to
+    an element - it may have been deleted from the model since colorize was
+    turned on, in which case there is nothing left to restore an override
+    onto and that's not an error worth interrupting the rest of the clear
+    operation over.
+
+    Opens exactly one Transaction ("ClashFlag: clear colorize overrides")
+    for the whole batch, same reasoning as `apply_colorize_overrides`.
+    """
+    transaction = Transaction(host_doc, "ClashFlag: clear colorize overrides")
+    transaction.Start()
+    try:
+        for id_int_value, previous_settings in previous_overrides.items():
+            element_id = ElementId(id_int_value)
+            try:
+                view.SetElementOverrides(element_id, previous_settings)
+            except Exception:
+                continue
+    except Exception:
+        transaction.RollBack()
+        raise
+    else:
+        transaction.Commit()
+
+
+# Kept alive here purely to prevent .NET/CLR garbage collection of an open
+# ClashListWindow. Unlike ScopePickerWindow (opened with the blocking
+# ShowDialog(), which keeps its own frame alive on the call stack until
+# closed), ClashListWindow is opened with the non-blocking Show() - the
+# script's __main__ block finishes executing (and its local variables go out
+# of scope) almost immediately after show_clash_list() returns, while the
 # window itself is still meant to stay open. Without holding a reference
 # somewhere that survives past script end, the window object would become
 # eligible for collection and could disappear/misbehave out from under the
@@ -1303,11 +1706,17 @@ class ClashListWindow(forms.WPFWindow):
     ``__main__``, NOT from inside this class) reads ``clash_result.
     host_element`` / ``.link_element`` / ``.link_instance_id`` to compute a
     combined bounding box and reframe the view - see
-    ``reframe_active_view_on_clash`` above; ticket 1005 would use the
-    category pair off those same two elements to pick an
-    ``OverrideGraphicSettings`` color. Do NOT reimplement Next/Previous/
-    list-click handling to add either behavior - hook in here instead so
-    there is only ever one navigation path.
+    ``reframe_active_view_on_clash`` above. Do NOT reimplement Next/Previous/
+    list-click handling to add new per-selection behavior - hook in here
+    instead so there is only ever one navigation path.
+
+    Ticket 1005 (colorize-by-category) does NOT use this hook, deliberately:
+    per that ticket, colorizing applies to every clash in
+    ``self.clash_results`` at once, not to whichever single clash is
+    currently selected, so it's a different kind of action from navigation.
+    It gets its own control instead - see ``ColorizeCheckBox`` in
+    ``clashflag_clash_list.xaml`` and ``colorize_checkbox_checked`` /
+    ``colorize_checkbox_unchecked`` below.
 
     Passing `selection_changed_callback` to the CONSTRUCTOR (rather than only
     ever setting it on the returned instance afterwards) matters for the
@@ -1331,6 +1740,21 @@ class ClashListWindow(forms.WPFWindow):
         # _set_current_index(0) call below fires it for the first clash.
         self.selection_changed_callback = selection_changed_callback
 
+        # T-5 / ticket 1005 (colorize by category) state. `colorize_active`
+        # and `colorize_previous_overrides` mirror the corresponding
+        # parameters of apply_colorize_overrides/clear_colorize_overrides -
+        # see colorize_checkbox_checked/_unchecked below and this module's
+        # "COLORIZE BY CATEGORY" section for what they're for.
+        # `colorize_view_id` remembers exactly which View was colorized
+        # (captured at apply time, NOT re-read from doc.ActiveView at clear
+        # time) because overrides are per-view state and the user could
+        # switch the active view while colorize stays checked - see
+        # clear_colorize_overrides's docstring for why clearing must target
+        # the SAME view it was applied to.
+        self.colorize_active = False
+        self.colorize_previous_overrides = {}
+        self.colorize_view_id = None
+
         for clash_result in self.clash_results:
             self.ClashListBox.Items.Add(clash_result.describe())
 
@@ -1340,6 +1764,115 @@ class ClashListWindow(forms.WPFWindow):
             self._set_current_index(0)
         else:
             self._update_status_and_buttons()
+            # Nothing to colorize either - matches the disabled Previous/
+            # Next buttons' "no clashes" treatment above.
+            self.ColorizeCheckBox.IsEnabled = False
+
+    def colorize_checkbox_checked(self, sender, args):
+        """Turn colorize-by-category ON for the WHOLE current
+        ``clash_results`` set at once - see the class docstring's
+        "EXTENSION HOOK" note for why this is a separate control from the
+        per-selection navigation hook, and ``apply_colorize_overrides`` /
+        this module's "ADDED IN 1005" docstring section for exactly what
+        does and doesn't get colorized (host-side elements only - a
+        researched Revit API limitation, not an oversight).
+
+        Does NOT call ``apply_colorize_overrides`` directly - this handler
+        itself runs outside a valid Revit API context (see the module
+        docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY"), so the actual
+        work is queued through ``_colorize_api_bridge`` and runs later, back
+        in a valid context, via ``_ColorizeApiBridge.Execute``.
+        """
+        def _apply():
+            active_view = doc.ActiveView
+            try:
+                previous_overrides = apply_colorize_overrides(
+                    self.clash_results, doc, active_view
+                )
+            except Exception as colorize_error:
+                forms.alert(
+                    "ClashFlag could not apply colorize overrides: {0}".format(
+                        colorize_error
+                    ),
+                    title="ClashFlag - colorize error",
+                )
+                # Safe to touch WPF state here even though this runs inside
+                # the ExternalEvent bridge's Execute(), not the original
+                # click handler - Execute() runs on the same main/UI thread
+                # the window's own dispatcher uses (see the module
+                # docstring), so this is not a cross-thread property set.
+                self.ColorizeCheckBox.IsChecked = False
+                return
+
+            self.colorize_previous_overrides = previous_overrides
+            self.colorize_view_id = active_view.Id
+            self.colorize_active = True
+            output.print_md(
+                "_ClashFlag: colorize by category is ON - host-side "
+                "clashing elements only. Revit has no API to override an "
+                "individual linked element's graphics from a host view "
+                "(researched, see clashflag_runner.py's module docstring), "
+                "so link-side elements are left untouched._"
+            )
+
+        _colorize_api_bridge.raise_action(_apply)
+
+    def colorize_checkbox_unchecked(self, sender, args):
+        """Turn colorize-by-category OFF: restore every host element this
+        tool touched back to its pre-colorize override state (see
+        ``clear_colorize_overrides``'s docstring), on the SAME view it was
+        applied to - not necessarily whatever view happens to be active
+        right now."""
+        self._clear_colorize_if_active()
+
+    def _clear_colorize_if_active(self):
+        """Shared by the Unchecked handler above AND by show_clash_list's
+        Closed-event cleanup below (ticket instruction: don't leave
+        overrides dangling in the model after this window's UI is gone) -
+        both need the exact same "restore and reset state" behavior, and
+        having two independent copies of it would risk them drifting apart.
+        No-ops if colorize was never turned on, or was already cleared -
+        both handlers can end up calling this on the same already-clean
+        state without harm (e.g. Unchecked firing once more during Close).
+
+        The ``colorize_active``/``colorize_previous_overrides``/
+        ``colorize_view_id`` reset happens SYNCHRONOUSLY here, immediately -
+        not deferred into the queued action below - specifically so a second
+        near-simultaneous call (e.g. unchecking the box right as the window
+        is also closing, firing Unchecked and Closed back to back) sees
+        ``colorize_active`` already False and no-ops instead of queuing a
+        second, redundant clear. The actual model-touching work (reading
+        `view` back via `doc.GetElement`, calling `clear_colorize_overrides`)
+        still has to happen later, in a valid API context, via the bridge -
+        that part is queued exactly like colorize_checkbox_checked's apply.
+        """
+        if not self.colorize_active:
+            return
+
+        view_id = self.colorize_view_id
+        previous_overrides = self.colorize_previous_overrides
+        self.colorize_active = False
+        self.colorize_previous_overrides = {}
+        self.colorize_view_id = None
+
+        def _clear():
+            view = doc.GetElement(view_id) if view_id else None
+            if view is not None:
+                try:
+                    clear_colorize_overrides(doc, view, previous_overrides)
+                except Exception as clear_error:
+                    output.print_md(
+                        "_ClashFlag: failed to fully clear colorize "
+                        "overrides: {0}_".format(clear_error)
+                    )
+            else:
+                output.print_md(
+                    "_ClashFlag: the view colorize was applied to no "
+                    "longer exists - its overrides could not be explicitly "
+                    "cleared (they went away with the view itself)._"
+                )
+
+        _colorize_api_bridge.raise_action(_clear)
 
     def _on_list_selection_changed(self, sender, args):
         """The one place ``current_index`` ever changes. Fires for direct
@@ -1388,8 +1921,9 @@ class ClashListWindow(forms.WPFWindow):
         index. Default implementation forwards to
         ``self.selection_changed_callback`` if one has been set; override
         this method in a subclass instead if you'd rather extend by
-        inheritance. Tickets 1004 (camera fly-to) and 1005 (colorize) should
-        each hook in here."""
+        inheritance. Ticket 1004 (camera fly-to) hooks in here; ticket 1005
+        (colorize) deliberately does NOT - see the class docstring's
+        "colorize-by-category" note above."""
         if self.selection_changed_callback is not None:
             self.selection_changed_callback(clash_result, index)
 
@@ -1417,10 +1951,8 @@ def show_clash_list(clash_results, selection_changed_callback=None):
     chance to return an instance for the caller to attach a callback to).
 
     Returns the ``ClashListWindow`` instance. The caller doesn't need to keep
-    it (a module-level list keeps it alive - see ``_open_clash_list_windows``
-    above) but ticket 1005 (colorize, not yet implemented) may want the
-    reference to also set/replace ``selection_changed_callback`` on it later,
-    or to subclass ``ClashListWindow`` instead.
+    it - a module-level list keeps it alive (see ``_open_clash_list_windows``
+    above).
     """
     xaml_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "clashflag_clash_list.xaml"
@@ -1429,11 +1961,18 @@ def show_clash_list(clash_results, selection_changed_callback=None):
 
     _open_clash_list_windows.append(window)
 
-    def _forget_window(sender, args):
+    def _on_window_closed(sender, args):
+        # T-5 / ticket 1005 instruction: don't leave colorize overrides
+        # dangling in the model after this window's UI is gone - if the
+        # checkbox was still checked when the user closed the window (title-
+        # bar close, Close button, or Escape all raise Closed the same way),
+        # clear them here using the exact same restore-previous-overrides
+        # path the Unchecked handler uses, BEFORE forgetting the window.
+        window._clear_colorize_if_active()
         if window in _open_clash_list_windows:
             _open_clash_list_windows.remove(window)
 
-    window.Closed += _forget_window
+    window.Closed += _on_window_closed
 
     window.Show()
     return window

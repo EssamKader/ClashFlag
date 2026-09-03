@@ -33,6 +33,7 @@
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <TextBlock Grid.Row="0"
@@ -44,7 +45,25 @@
 
         <TextBlock Grid.Row="2" x:Name="StatusText" Text="" Margin="0,0,0,8" FontWeight="Bold"/>
 
-        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right">
+        <!--
+        T-5 / ticket 1005 (US-5): colorize-by-category toggle. Applies to the
+        WHOLE current clash_results set at once, not to whichever single
+        clash is currently selected - a different kind of action from
+        Previous/Next/list-click navigation, so it gets its own control
+        rather than reusing the selection-changed hook. See
+        ClashListWindow.colorize_checkbox_checked/_unchecked in
+        clashflag_runner.py for what it actually does, and why only
+        host-model elements are colorized (a researched Revit API
+        limitation on linked elements - see that same docstring).
+        -->
+        <CheckBox Grid.Row="3" x:Name="ColorizeCheckBox"
+                  Content="Colorize clashes by category"
+                  Margin="0,0,0,8"
+                  Checked="colorize_checkbox_checked"
+                  Unchecked="colorize_checkbox_unchecked"
+                  ToolTip="Color-codes each clash's HOST-side element by its host/link category pair, consistently across the current result set. Linked-side elements can't be colorized this way - Revit has no API to override an individual linked element's graphics from a host view."/>
+
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="PreviousButton" Content="Previous" Width="90" Height="28" Margin="0,0,8,0"
                     Click="previous_button_click"/>
             <Button x:Name="NextButton" Content="Next" Width="90" Height="28" Margin="0,0,8,0"

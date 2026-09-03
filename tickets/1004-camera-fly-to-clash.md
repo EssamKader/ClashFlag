@@ -1,4 +1,4 @@
-label: done
+label: ready-for-agent
 
 # T-4: Camera auto-navigation to selected clash
 
@@ -154,7 +154,7 @@ catch. This should move to `done` only after a real pyRevit/Revit smoke test
 confirms the camera actually reframes correctly on both clash elements in an actual
 3D view, or after review is satisfied the research above is sufficient without one.
 
-## Phase 7 review: PASS
+## Phase 7 review round 1: PASS (superseded — see round 2 reopen below)
 
 Read `_transform_all_corners`, `_combined_host_space_bounding_box`,
 `reframe_active_view_on_clash`, and the `__main__`/`ClashListWindow` wiring
@@ -176,4 +176,41 @@ real-world calibration question ticket 1007 (live-model performance/correctness
 validation) is positioned to catch, not a logic defect — not a blocker for closing
 this ticket. Closing.
 
-**Closed.**
+**Closed.** *(superseded — reopened below)*
+
+## Reopened at Phase 7 review, round 2 (during ticket 1005's review)
+
+**Confirmed regression, independently re-verified via WebSearch:** a modeless
+`forms.WPFWindow` (`ClashListWindow`, per 1003) only runs inside a valid Revit API
+execution context for as long as the pyRevit script's own `__main__` is still on
+the call stack. `reframe_active_view_on_clash` is invoked directly from
+`ClashListWindow.on_selection_changed` → `selection_changed_callback` — a WPF
+event handler that keeps firing long after `__main__` has returned (every
+Next/Previous click, every direct list-row click). Only the very first
+auto-selected clash (fired synchronously during `ClashListWindow.__init__`,
+itself still inside `__main__`) happens to be in a valid context; every
+subsequent navigation would throw
+`Autodesk.Revit.Exceptions.InvalidOperationException` the moment it touches
+`host_doc.ActiveView` / `resolve_link_instance_by_id` /
+`host_uidoc.GetOpenUIViews()` / `target_uiview.ZoomAndCenterRectangle`.
+
+This exact constraint is what ticket 1005 (colorize) independently researched and
+built `_ColorizeApiBridge` (an `ExternalEvent`/`IExternalEventHandler` bridge) to
+work around — confirmed via multiple independent sources (Autodesk's own Revit
+API developer guide on External Events, Jeremy Tammik's Building Coder, a
+pyRevit-specific worked example hitting this exact exception from a modeless
+WPFWindow handler).
+
+**Fix:** route `reframe_active_view_on_clash` through the same bridge mechanism
+1005 already built, rather than calling it directly from the selection-changed
+callback in `__main__`. Since the bridge is no longer colorize-specific once
+1004 also needs it, rename `_ColorizeApiBridge`/`_colorize_api_bridge` to a
+neutral name (e.g. `_RevitApiBridge`/`_revit_api_bridge`) and update every call
+site (1005's `colorize_checkbox_checked`/`_clear_colorize_if_active`, plus 1004's
+camera callback) to use the renamed version. Route camera reframing through the
+bridge unconditionally (including the very first auto-selected clash) rather than
+keeping a special-cased "first call is fine, later ones need the bridge" branch —
+uniform behavior is simpler and more robust than relying on that timing
+distinction staying true forever.
+
+**Status:** reopened, needs rework.
