@@ -67,17 +67,58 @@ modal window would block that. It exposes a documented extension hook
 and 1005 to attach camera-navigation and colorize-by-category behavior to,
 respectively - neither is implemented in this file.
 
+ADDED IN 1004 (T-4, this revision): camera auto-navigation (US-4).
+``ClashResult`` now also carries ``link_instance_id`` (the ``ElementId`` of
+the ``RevitLinkInstance`` a pair was found against, captured once inside
+``run_interference_check`` right where ``link_instance`` is already in
+scope) rather than only the display-name string it carried before - re-
+deriving "which RevitLinkInstance produced this element" later by re-
+searching loaded links and matching on ``link_name`` would be fragile (names
+aren't guaranteed unique - Revit only disambiguates same-document instances
+with a " : 2" suffix, and a user could rename one) and wasteful (the exact
+instance was already known at the moment the ``ClashResult`` was built).
+``_combined_host_space_bounding_box`` uses it, via
+``resolve_link_instance_by_id``/``resolve_link_document`` (ticket 1002), to
+re-resolve the exact ``RevitLinkInstance`` and read its
+``GetTotalTransform()`` on demand - never by name-search. That function
+computes one combined bounding box, in HOST space, covering both elements of
+a ``ClashResult`` - the host element's box is already host-space
+(``Element.get_BoundingBox(view)``, per 1001's established "Element boxes
+are already world-aligned, unlike Solid.GetBoundingBox()" knowledge); the
+link element's box is read in LINK-LOCAL space the same way and then
+transformed into host space by running all 8 corners of that local box
+through the link's transform - the exact technique ``_outline_for_solid``
+below already uses for solids, factored out into a shared
+``_transform_all_corners`` helper and reused rather than reimplemented, for
+the identical reason: a rotated/mirrored link placement can under-cover the
+true extents if only the two extreme corners are transformed.
+``reframe_active_view_on_clash`` then reframes the ACTIVE VIEW's camera onto
+that combined box via ``UIView.ZoomAndCenterRectangle`` (researched via web
+search - see that function's docstring for what was verified vs. what
+remains an educated guess) - skipping (with a console note, not a modal
+popup, since this fires on every list navigation step) whenever the active
+view isn't a ``View3D`` or a bounding box can't be read. Wired to
+``ClashListWindow`` via its existing ``selection_changed_callback`` /
+``on_selection_changed`` extension hook from ticket 1003 - this file's
+navigation logic itself (``_on_list_selection_changed``, ``_set_current_
+index``, Next/Previous handlers) is untouched. ``ClashListWindow.__init__``
+and ``show_clash_list`` gained one new optional trailing parameter
+(``selection_changed_callback``) so the callback can be attached BEFORE the
+initial clash (index 0) is auto-selected at window-open time - without this,
+the very first clash shown would not trigger a camera move, only subsequent
+Next/Previous/click navigation would, which would contradict US-4 for the
+common case of a run that finds exactly one clash.
+
 Deliberately still out of scope (see specs/clash-flag.md "out of scope" +
-tickets/1004-1005):
+ticket 1005):
     - No tolerance / near-miss ("soft clash") logic - hard (real, non-zero-
       volume intersection) clashes only. The small epsilons used below exist
       ONLY to absorb floating-point noise (e.g. two solids that share a face
       exactly) - they are not a clearance/tolerance feature and are not
       user-configurable.
-    - No camera auto-fly-to-clash or colorize-by-category (later US-4/5,
-      tickets 1004-1005) - ``ClashListWindow`` provides the navigation hook
-      those tickets need, but does not itself move the camera or touch
-      element graphics overrides.
+    - No colorize-by-category (later US-5, ticket 1005) - ``ClashListWindow``
+      provides the same navigation hook 1005 needs, but this file does not
+      touch element graphics overrides.
     - pyRevit pushbutton/bundle packaging (ticket 1006) - this is still a
       flat, directly-run script.
 
@@ -117,6 +158,7 @@ from Autodesk.Revit.DB import (
     RevitLinkInstance,
     Solid,
     SolidUtils,
+    View3D,
     ViewDetailLevel,
     XYZ,
 )
@@ -128,6 +170,11 @@ from pyrevit import revit, script, forms
 
 output = script.get_output()
 doc = revit.doc
+# ``revit.uidoc`` is a standard pyrevit.revit module attribute (returns
+# __revit__.ActiveUIDocument) - used below (1004) to reach
+# UIDocument.GetOpenUIViews() for camera reframing. Resolved once here, same
+# as `doc`, rather than re-fetched per call.
+uidoc = revit.uidoc
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +212,14 @@ LINKED_MODEL_INSTANCE_NAME = "NUPCO-STRUCT-LINK.rvt"
 # between "clash" and "no clash" between runs.
 BBOX_OVERLAP_TOLERANCE_FEET = 1.0e-6
 MIN_CLASH_VOLUME_FEET3 = 1.0e-9
+
+# 1004 (camera fly-to): fraction of each axis's extent to pad the combined
+# clash bounding box by, on both sides, before reframing the camera on it -
+# NOT a tolerance/clash-detection value (unrelated to the two guards above),
+# purely a "don't leave the clash geometry flush against the view edge" UX
+# nicety, matching how Revit's own "zoom to fit" style behaviors always
+# leave some margin. See _pad_bounding_box().
+CAMERA_REFRAME_PADDING_FRACTION = 0.15
 
 
 class ClashFlagError(Exception):
@@ -430,6 +485,40 @@ def collect_candidate_solids(source_doc, categories, link_transform=None):
     return candidates, skipped_elements
 
 
+def _transform_all_corners(local_min, local_max, local_to_target_transform):
+    """Return (target_min, target_max) - two ``XYZ`` points describing the
+    smallest axis-aligned box, in the TARGET space, that fully contains the
+    axis-aligned box [local_min, local_max] from some LOCAL space, given the
+    ``Transform`` that maps local -> target.
+
+    Transforms all 8 corners of the local box (not just the two extreme
+    corners `local_min`/`local_max` themselves) before re-deriving min/max.
+    This matters whenever `local_to_target_transform` can carry rotation or
+    mirroring (a rotated/mirrored link placement, or a Solid's own local bbox
+    frame - see both call sites of this function below): running only the
+    two extreme corners through such a transform does NOT produce a valid
+    axis-aligned box around the transformed content - it can under-cover it.
+    Originally written inline in ``_outline_for_solid`` (below) for the
+    per-solid pre-filter pipeline; factored out here (1004) so
+    ``_combined_host_space_bounding_box`` can reuse the exact same,
+    already-reviewed technique for link-element bounding boxes instead of
+    re-deriving a parallel (and possibly subtly different/wrong) version of
+    it.
+    """
+    xs, ys, zs = [], [], []
+    for x in (local_min.X, local_max.X):
+        for y in (local_min.Y, local_max.Y):
+            for z in (local_min.Z, local_max.Z):
+                corner = local_to_target_transform.OfPoint(XYZ(x, y, z))
+                xs.append(corner.X)
+                ys.append(corner.Y)
+                zs.append(corner.Z)
+
+    target_min = XYZ(min(xs), min(ys), min(zs))
+    target_max = XYZ(max(xs), max(ys), max(zs))
+    return target_min, target_max
+
+
 def _outline_for_solid(solid):
     """Return an ``Outline`` (axis-aligned box) for `solid`, expressed in
     whatever space `solid`'s own geometry is already in (by the time this is
@@ -449,8 +538,9 @@ def _outline_for_solid(solid):
     Transforming only the Min and Max corners through a rotated transform
     does NOT give a valid axis-aligned box around the rotated solid - it can
     under-cover it, causing the pre-filter to wrongly discard a real
-    clash. The fix is to transform all 8 corners of the local box and take
-    the min/max of the transformed set, which is what this function does.
+    clash. The fix (delegated to ``_transform_all_corners``) is to transform
+    all 8 corners of the local box and take the min/max of the transformed
+    set.
     """
     try:
         bbox = solid.GetBoundingBox()
@@ -460,21 +550,7 @@ def _outline_for_solid(solid):
     if bbox is None:
         return None
 
-    tf = bbox.Transform
-    lo = bbox.Min
-    hi = bbox.Max
-
-    xs, ys, zs = [], [], []
-    for x in (lo.X, hi.X):
-        for y in (lo.Y, hi.Y):
-            for z in (lo.Z, hi.Z):
-                corner = tf.OfPoint(XYZ(x, y, z))
-                xs.append(corner.X)
-                ys.append(corner.Y)
-                zs.append(corner.Z)
-
-    world_min = XYZ(min(xs), min(ys), min(zs))
-    world_max = XYZ(max(xs), max(ys), max(zs))
+    world_min, world_max = _transform_all_corners(bbox.Min, bbox.Max, bbox.Transform)
 
     try:
         return Outline(world_min, world_max)
@@ -892,12 +968,31 @@ class ClashResult(object):
       distinct links, so the panel needs to say which link each row came
       from - the pair alone (two Elements) doesn't disambiguate that once
       flattened across links.
+    - link_instance_id (added 1004): the ``ElementId`` of that SAME
+      ``RevitLinkInstance`` - the object itself is already in scope right
+      where ``run_interference_check`` builds each ``ClashResult`` (as
+      ``link_instance``, resolved once per selected link via
+      ``resolve_link_instance_by_id``), so it's captured here rather than
+      left for a later consumer (ticket 1004's camera fly-to) to re-derive by
+      searching loaded links and matching on `link_name`. Matching on a
+      display name would be fragile - names aren't guaranteed unique (only
+      same-document repeat instances get a " : 2"-style Revit-assigned
+      suffix; a user can still rename links to collide) - and wasteful,
+      re-doing a lookup whose answer was already known at creation time.
+      Re-resolving the live ``RevitLinkInstance`` from this id (rather than
+      holding onto the object reference itself) is intentional and mirrors
+      ticket 1002's existing ``link_element_id`` -> ``resolve_link_instance_
+      by_id`` pattern: it keeps ``ClashResult`` from depending on a specific
+      .NET object reference staying valid/meaningful for as long as the
+      modeless clash list window stays open, across whatever else happens in
+      the Revit session meanwhile.
     """
 
-    def __init__(self, host_element, link_element, link_name):
+    def __init__(self, host_element, link_element, link_name, link_instance_id):
         self.host_element = host_element
         self.link_element = link_element
         self.link_name = link_name
+        self.link_instance_id = link_instance_id
 
     def describe(self):
         """One-line display string for this clash, used as a ListBox row in
@@ -909,6 +1004,254 @@ class ClashResult(object):
             self.link_name,
             describe_element(self.link_element),
         )
+
+
+# ---------------------------------------------------------------------------
+# CAMERA FLY-TO-CLASH (T-4 / ticket 1004)
+# ---------------------------------------------------------------------------
+
+def _pad_bounding_box(box_min, box_max, fraction):
+    """Expand the axis-aligned box [box_min, box_max] outward by `fraction`
+    of each axis's own extent, on both sides.
+
+    Not part of the ticket's literal ask - a small, low-risk UX addition (in
+    the same spirit as ticket 1003's StatusText/button-enabled additions) so
+    a reframed clash's own geometry doesn't end up sitting exactly flush
+    against the edge of the view, matching how Revit's built-in "zoom to
+    fit"-style behaviors (e.g. ``UIDocument.ShowElements``) always leave some
+    margin rather than fitting edge-to-edge.
+
+    Degenerates gracefully for a zero/near-zero-size axis (e.g. a clash
+    between two nearly coplanar/flat elements, where one axis of the combined
+    box has ~0 extent) by falling back to a small fixed 1-foot pad on that
+    axis instead of `0 * fraction == 0`, so ``ZoomAndCenterRectangle`` below
+    is never handed a degenerate (zero-thickness on every axis normal to the
+    view) rectangle.
+    """
+    mins = (box_min.X, box_min.Y, box_min.Z)
+    maxs = (box_max.X, box_max.Y, box_max.Z)
+
+    padded_min = []
+    padded_max = []
+    for lo, hi in zip(mins, maxs):
+        extent = hi - lo
+        pad = extent * fraction
+        if pad <= 0:
+            pad = 1.0
+        padded_min.append(lo - pad)
+        padded_max.append(hi + pad)
+
+    return XYZ(*padded_min), XYZ(*padded_max)
+
+
+def _combined_host_space_bounding_box(clash_result, host_doc, active_view):
+    """Compute one combined (min_xyz, max_xyz) bounding box, in HOST
+    coordinate space, covering BOTH elements of `clash_result` - the pair
+    the camera should reframe on for US-4.
+
+    - `clash_result.host_element` is already in host space (it's a live
+      element of the active document). Per ticket 1001's established
+      knowledge (see ``_outline_for_solid``'s docstring above),
+      ``Element.get_BoundingBox(view)`` - unlike ``Solid.GetBoundingBox()`` -
+      returns a box whose Min/Max are already expressed directly in that
+      element's own document's coordinate system, with no separate
+      local-frame ``Transform`` step to worry about. For the HOST element,
+      that coordinate system already IS host space. `active_view` (the
+      active 3D view) is passed through, matching the standard "zoom to
+      element in view X" call pattern - it must be a view belonging to
+      `host_doc` (a Revit API requirement of this overload), which the
+      active view of `host_doc` always is.
+    - `clash_result.link_element` lives in the LINKED document, so by the
+      same Element-bbox reasoning its own ``get_BoundingBox()`` result is
+      already expressed directly in THAT document's coordinate system - which
+      is LINK-LOCAL space, not host space. It is read with a ``None`` view
+      argument (there is no view of the link's own document to pass - the
+      active view belongs to `host_doc`, and passing a `host_doc` view for an
+      element of a different document is not a supported combination), then
+      transformed into host space here via the link's
+      ``RevitLinkInstance.GetTotalTransform()``, using ``_transform_all_
+      corners`` - the SAME "transform all 8 corners, not just 2" technique
+      ``_outline_for_solid`` already uses for solids, reused rather than
+      reimplemented, for the identical reason: a rotated/mirrored link
+      placement can under-cover the true extents if only the two extreme
+      corners are transformed.
+
+    The `RevitLinkInstance` is re-resolved from `clash_result.
+    link_instance_id` via ``resolve_link_instance_by_id``/``resolve_link_
+    document`` (ticket 1002) rather than trusting `clash_result.link_element`
+    alone to still make sense - this also gets us a specific, actionable
+    ``ClashFlagError`` (e.g. "link no longer loaded") if the link was
+    unloaded/removed since the run that found this clash, instead of a bare
+    bounding-box read failure with no explanation.
+
+    Returns None (not an exception) if a bounding box specifically can't be
+    read for either element (e.g. get_BoundingBox returning None) - that is
+    not really an error case ClashFlagError's user-facing wording fits, just
+    "nothing to reframe on this time." Raises ClashFlagError (propagated,
+    uncaught) if the link itself can no longer be resolved/loaded - the
+    caller (``reframe_active_view_on_clash``) catches that specifically so it
+    can report the precise reason.
+    """
+    try:
+        host_bbox = clash_result.host_element.get_BoundingBox(active_view)
+    except Exception:
+        host_bbox = None
+    if host_bbox is None:
+        return None
+
+    link_instance = resolve_link_instance_by_id(
+        host_doc, clash_result.link_instance_id
+    )
+    # Raises ClashFlagError if the link is no longer loaded - checked here
+    # (not just left to a get_BoundingBox() failure below) purely so the
+    # caller gets a specific, actionable message rather than a silent None.
+    resolve_link_document(link_instance)
+
+    try:
+        link_bbox = clash_result.link_element.get_BoundingBox(None)
+    except Exception:
+        link_bbox = None
+    if link_bbox is None:
+        return None
+
+    # Link-local -> host, for THIS specific RevitLinkInstance - same choice
+    # (GetTotalTransform over GetTransform, to fold in true-north) as
+    # run_interference_check() makes for the detection pipeline itself.
+    link_transform = link_instance.GetTotalTransform()
+    link_host_min, link_host_max = _transform_all_corners(
+        link_bbox.Min, link_bbox.Max, link_transform
+    )
+
+    host_min, host_max = host_bbox.Min, host_bbox.Max
+    combined_min = XYZ(
+        min(host_min.X, link_host_min.X),
+        min(host_min.Y, link_host_min.Y),
+        min(host_min.Z, link_host_min.Z),
+    )
+    combined_max = XYZ(
+        max(host_max.X, link_host_max.X),
+        max(host_max.Y, link_host_max.Y),
+        max(host_max.Z, link_host_max.Z),
+    )
+    return combined_min, combined_max
+
+
+def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
+    """Reframe the ACTIVE view's camera onto the combined bounding box of
+    `clash_result`'s two clashing elements - the camera-fly-to behavior from
+    US-4 / ticket 1004, equivalent to what Revit's built-in Interference
+    Check dialog's "Show" button does for a found clash.
+
+    Returns True if the view was reframed, False if it was skipped (reported
+    via ``output.print_md`` - a one-line console note, NOT a modal
+    ``forms.alert`` - this runs on every clash-list navigation step, and a
+    popup on every click would be far more disruptive than a console line
+    the user can ignore while stepping through the list).
+
+    ACTIVE-VIEW-NOT-3D HANDLING (ticket instruction #4): if the active view
+    is not a ``View3D`` (covers "no active view" too, since None also fails
+    the isinstance check), camera reframing is skipped entirely - it does
+    NOT switch the user to some other 3D view, or create one. Silently
+    changing the user's active view as a side effect of clicking a clash-list
+    row would be more disruptive than just not moving the camera, and
+    "which" 3D view to use if none is active is an ambiguous, unrequested
+    design decision (the built-in Interference Check "Show" button has the
+    same constraint - it reframes whatever 3D view is already open/active,
+    it doesn't manufacture one). The user is expected to have a 3D view
+    active before relying on fly-to-clash.
+
+    API CHOICE - RESEARCHED, NOT GUESSED (see tickets/1004-camera-fly-to-
+    clash.md's "Implementation" section for the full source trail):
+    ``UIView.ZoomAndCenterRectangle(viewCorner1, viewCorner2)`` is used, with
+    the two (padded) corners of the combined bounding box, in MODEL
+    coordinates. Verified against revitapidocs.com's method description
+    ("Zoom and center the view to a specified rectangle", both parameters
+    documented as being in model coordinates) AND a real, working pyRevit-
+    forum example doing exactly this "zoom the active view to an element's
+    bounding box" pattern (``get_BoundingBox()`` -> ``ZoomAndCenterRectangle
+    (min, max)``, no extra transform beyond the one already applied to get
+    into model/host space). Chosen over two other candidates considered:
+      - ``View3D.SetSectionBox`` - rejected because it CROPS the view (a
+        persisted, visible view-state change - confirmed via revitapidocs.com
+        that ``SetSectionBox`` changes what geometry the view displays and
+        would need ``IsSectionBoxActive`` managed and a ``Transaction``,
+        since it writes a view parameter) rather than just moving the
+        camera to look at something - a materially more invasive, longer-
+        lived effect than the native "Show" button produces, and would still
+        be showing a cropped model after the user closes the clash list.
+      - Manually computing a new ``ViewOrientation3D`` (eye position/forward/
+        up vector) - rejected as substantially more failure-prone (has to
+        derive a correct eye distance from the box size plus the view's
+        field of view/aspect ratio by hand) for no behavioral benefit over a
+        method the API already provides for exactly "fit the view to this
+        rectangle."
+
+    UNVERIFIED / FLAG FOR REVIEWER: search also turned up a forum report of
+    "strange"/aspect-ratio-related ``ZoomAndCenterRectangle`` behavior in
+    some 3D-view scenarios, and neither source that was found distinguishes
+    PERSPECTIVE (camera) 3D views from ORTHOGRAPHIC 3D views specifically -
+    the working forum example didn't state which kind it used. This has NOT
+    been exercised against a live Revit session in this sandbox (none is
+    available here). If it visibly misbehaves specifically on a perspective/
+    camera 3D view during first real testing, the fallback is either to
+    require an orthographic 3D view, or to switch to the manual
+    ``ViewOrientation3D`` approach noted above.
+
+    NO TRANSACTION: this only changes the transient on-screen pan/zoom state
+    of an already-open ``UIView`` window - the same kind of change a user
+    causes by scrolling/zooming with the mouse wheel. It does not create,
+    delete, or modify any element, parameter, or persisted view property in
+    either document, so no ``Transaction`` is opened here, consistent with
+    the rest of this file's read-only design (see the module docstring).
+    """
+    active_view = host_doc.ActiveView
+    if not isinstance(active_view, View3D):
+        output.print_md(
+            "_ClashFlag: active view is not a 3D view - skipping camera "
+            "reframe for this clash. Switch to a 3D view to use camera "
+            "fly-to._"
+        )
+        return False
+
+    try:
+        combined_box = _combined_host_space_bounding_box(
+            clash_result, host_doc, active_view
+        )
+    except ClashFlagError as combine_error:
+        output.print_md("_ClashFlag: {0}_".format(combine_error))
+        return False
+
+    if combined_box is None:
+        output.print_md(
+            "_ClashFlag: could not read a bounding box for one or both "
+            "elements in this clash - skipping camera reframe._"
+        )
+        return False
+
+    padded_min, padded_max = _pad_bounding_box(
+        combined_box[0], combined_box[1], CAMERA_REFRAME_PADDING_FRACTION
+    )
+
+    target_uiview = None
+    for open_uiview in host_uidoc.GetOpenUIViews():
+        if open_uiview.ViewId == active_view.Id:
+            target_uiview = open_uiview
+            break
+
+    if target_uiview is None:
+        output.print_md(
+            "_ClashFlag: the active 3D view isn't open in any on-screen "
+            "window (no matching UIView) - skipping camera reframe._"
+        )
+        return False
+
+    try:
+        target_uiview.ZoomAndCenterRectangle(padded_min, padded_max)
+    except Exception as zoom_error:
+        output.print_md("_ClashFlag: camera reframe failed: {0}_".format(zoom_error))
+        return False
+
+    return True
 
 
 # Kept alive here purely to prevent .NET/CLR garbage collection of an open
@@ -944,26 +1287,38 @@ class ClashListWindow(forms.WPFWindow):
     path that ever updates the current clash and fires the extension hook
     below, regardless of how the user triggered the change.
 
-    EXTENSION HOOK for future tickets (1004 camera fly-to, 1005 colorize):
-    every time the current clash changes, this window calls
+    EXTENSION HOOK for camera fly-to (1004) and colorize (1005, not yet
+    implemented): every time the current clash changes, this window calls
     ``self.on_selection_changed(clash_result, index)``. To hook in without
     touching any navigation logic above, EITHER:
-      - set ``window.selection_changed_callback = your_function`` on an
-        instance (``on_selection_changed``'s default implementation just
+      - pass ``selection_changed_callback`` to the constructor (or set
+        ``window.selection_changed_callback = your_function`` on an instance
+        afterwards - ``on_selection_changed``'s default implementation just
         forwards to this callback if one is set, otherwise it's a no-op), OR
       - subclass ``ClashListWindow`` and override ``on_selection_changed``
         directly.
     ``your_function(clash_result, index)`` / the override receives the
     ``ClashResult`` now selected and its integer index in
-    ``self.clash_results`` - ticket 1004 would read ``clash_result.host_element``
-    / ``.link_element`` to compute a combined bounding box and reframe the
-    view; ticket 1005 would use the category pair off those same two elements
-    to pick an ``OverrideGraphicSettings`` color. Neither is implemented here.
-    Do NOT reimplement Next/Previous/list-click handling to add that behavior
-    - hook in here instead so there is only ever one navigation path.
+    ``self.clash_results``. Ticket 1004 (camera fly-to, wired from
+    ``__main__``, NOT from inside this class) reads ``clash_result.
+    host_element`` / ``.link_element`` / ``.link_instance_id`` to compute a
+    combined bounding box and reframe the view - see
+    ``reframe_active_view_on_clash`` above; ticket 1005 would use the
+    category pair off those same two elements to pick an
+    ``OverrideGraphicSettings`` color. Do NOT reimplement Next/Previous/
+    list-click handling to add either behavior - hook in here instead so
+    there is only ever one navigation path.
+
+    Passing `selection_changed_callback` to the CONSTRUCTOR (rather than only
+    ever setting it on the returned instance afterwards) matters for the
+    very first clash: ``__init__`` auto-selects index 0 immediately below
+    (before returning to any caller), which fires this same hook - a
+    callback attached only after construction would silently miss that
+    initial auto-selection and only ever fire on subsequent Next/Previous/
+    click navigation.
     """
 
-    def __init__(self, xaml_file_path, clash_results):
+    def __init__(self, xaml_file_path, clash_results, selection_changed_callback=None):
         forms.WPFWindow.__init__(self, xaml_file_path)
 
         self.clash_results = list(clash_results)
@@ -971,8 +1326,10 @@ class ClashListWindow(forms.WPFWindow):
 
         # Extension point for tickets 1004/1005 - see class docstring. None
         # means "no callback attached"; on_selection_changed() below no-ops
-        # in that case.
-        self.selection_changed_callback = None
+        # in that case. Set from the constructor argument (not just left for
+        # external assignment) so it's already in place before the initial
+        # _set_current_index(0) call below fires it for the first clash.
+        self.selection_changed_callback = selection_changed_callback
 
         for clash_result in self.clash_results:
             self.ClashListBox.Items.Add(clash_result.describe())
@@ -1046,22 +1403,29 @@ class ClashListWindow(forms.WPFWindow):
         self.Close()
 
 
-def show_clash_list(clash_results):
+def show_clash_list(clash_results, selection_changed_callback=None):
     """Show the modeless T-3 clash list window for `clash_results` (expected
     non-empty - see run_interference_check's caller in __main__, which skips
     calling this at all when a run finds zero clashes rather than opening an
     empty panel).
 
+    `selection_changed_callback` (added 1004), if given, is forwarded straight
+    to ``ClashListWindow``'s constructor rather than set on the returned
+    instance afterwards - see that constructor's docstring for why the
+    timing matters (the very first clash is auto-selected, and hence the hook
+    fired, DURING construction, before this function would otherwise have a
+    chance to return an instance for the caller to attach a callback to).
+
     Returns the ``ClashListWindow`` instance. The caller doesn't need to keep
     it (a module-level list keeps it alive - see ``_open_clash_list_windows``
-    above) but a future ticket wiring up 1004/1005 may want the reference to
-    set ``selection_changed_callback`` on it, or on a subclass instance
-    constructed in its place.
+    above) but ticket 1005 (colorize, not yet implemented) may want the
+    reference to also set/replace ``selection_changed_callback`` on it later,
+    or to subclass ``ClashListWindow`` instead.
     """
     xaml_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "clashflag_clash_list.xaml"
     )
-    window = ClashListWindow(xaml_path, clash_results)
+    window = ClashListWindow(xaml_path, clash_results, selection_changed_callback)
 
     _open_clash_list_windows.append(window)
 
@@ -1198,7 +1562,9 @@ def run_interference_check(scope_selection):
                     describe_element(element2),
                 )
             )
-            all_clash_results.append(ClashResult(element1, element2, link_name))
+            all_clash_results.append(
+                ClashResult(element1, element2, link_name, link_instance.Id)
+            )
 
     output.print_md("---")
     output.print_md(
@@ -1224,7 +1590,23 @@ if __name__ == "__main__":
             # would be redundant and confusing (per ticket 1003 instruction
             # #5: don't show an empty panel for a zero-clash run).
             if clash_results:
-                show_clash_list(clash_results)
+                # 1004: wire camera fly-to via ClashListWindow's existing
+                # selection_changed_callback hook - passed straight into
+                # show_clash_list (not set on the returned window afterwards)
+                # so it's already attached before the window auto-selects
+                # clash #0 during construction (see show_clash_list's and
+                # ClashListWindow.__init__'s docstrings for why that ordering
+                # matters). This is wiring only - no navigation logic in
+                # ClashListWindow itself is touched.
+                def _on_clash_selection_changed(clash_result, index):
+                    if clash_result is None:
+                        return
+                    reframe_active_view_on_clash(clash_result, doc, uidoc)
+
+                show_clash_list(
+                    clash_results,
+                    selection_changed_callback=_on_clash_selection_changed,
+                )
     except ClashFlagError as clash_flag_error:
         # Expected, actionable setup problem (e.g. a link unloaded since the
         # picker was shown) - show the user a clear message instead of a raw
