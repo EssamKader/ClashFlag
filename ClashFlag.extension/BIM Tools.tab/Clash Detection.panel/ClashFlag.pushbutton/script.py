@@ -170,6 +170,24 @@ needed its own control rather than piggy-backing on 1004's hook. See the
 ``apply_colorize_overrides`` / ``clear_colorize_overrides`` and the
 category-pair-to-color mapping.
 
+REVISED IN 1008 (T-8): live testing found the category-pair key was
+accidentally ORDER-DEPENDENT - ``_category_pair_key`` returned
+``(host_category_name, link_category_name)`` as an ordered tuple, so the
+same real-world pairing (e.g. Walls + Air Terminals) got a different dict
+key, and therefore a different color, depending on which file happened to
+be open as host that day. Fixed by sorting the two names before tupling
+them (see ``_category_pair_key``'s own docstring). Same ticket also replaced
+``_build_category_pair_color_map``'s fixed 10-color palette (cycled by index
+over the alphabetically-sorted distinct pairs present - collided once a
+model had more than 10 simultaneous distinct pairs, and a pair's color could
+shift when a sibling pair started/stopped appearing) with a deterministic
+hash of the pair's (now order-independent) key into an HSL hue, fixed
+saturation/lightness for legibility - see ``_color_for_category_pair`` and
+``_stable_hash_int``'s docstrings for the full reasoning, including why
+Python's built-in ``hash()`` was deliberately NOT used (it is salted per-
+process via ``PYTHONHASHSEED`` since Python 3.3, which would have silently
+broken the "same pair, same color, every run" requirement).
+
 RESEARCHED, NOT GUESSED - IMPORTANT LIMITATION: this ticket's obvious literal
 ask ("apply OverrideGraphicSettings to every host_element AND every
 link_element") turns out to be impossible for the link_element half via any
@@ -227,11 +245,12 @@ writing any of the code below:
       spec-owner to weigh in on.
 
 Given the above, this revision colorizes ONLY the HOST-SIDE element of each
-clash by its (host category, link category) pair - genuinely correct,
-transacted, and toggle-safe - and does NOT attempt any link-side element
-override. A console note (`output.print_md`) says so every time colorize is
-turned on, and the checkbox's XAML tooltip says so up front, so this isn't a
-silent gap from the user's point of view.
+clash by its ORDER-INDEPENDENT category pair (see the "REVISED IN 1008" note
+above and ``_category_pair_key``) - genuinely correct, transacted, and
+toggle-safe - and does NOT attempt any link-side element override. A console
+note (`output.print_md`) says so every time colorize is turned on, and the
+checkbox's XAML tooltip says so up front, so this isn't a silent gap from the
+user's point of view.
 
 SECOND RESEARCHED-NOT-GUESSED SUBTLETY (originally found via 1005's colorize
 checkbox, later confirmed to equally affect 1004's camera fly-to - see the
@@ -301,6 +320,8 @@ whole batch that rolls back on failure rather than leaving a half-applied
 transaction open.
 """
 
+import colorsys
+import hashlib
 import os
 
 import clr
@@ -1696,22 +1717,16 @@ class _RevitApiBridge(IExternalEventHandler):
 _revit_api_bridge = _RevitApiBridge()
 
 
-# Small, hand-picked, mutually-distinguishable palette (ColorBrewer-style
-# "qualitative" hues - deliberately not randomly generated, so adjacent
-# entries never land on near-duplicate colors) cycled across every distinct
-# (host_category, link_category) pair seen in the current clash_results.
-_CATEGORY_PAIR_COLOR_PALETTE = [
-    Color(228, 26, 28),    # red
-    Color(55, 126, 184),   # blue
-    Color(77, 175, 74),    # green
-    Color(255, 127, 0),    # orange
-    Color(152, 78, 163),   # purple
-    Color(255, 255, 51),   # yellow
-    Color(166, 86, 40),    # brown
-    Color(247, 129, 191),  # pink
-    Color(153, 153, 153),  # gray
-    Color(0, 128, 128),    # teal
-]
+# Fixed saturation/lightness for every hash-derived category-pair color (see
+# `_color_for_category_pair`) - chosen so the resulting RGB stays legible
+# against Revit's default white view background in BOTH the Wireframe style
+# (where only the thin projection/cut line color is visible - too light and
+# it disappears into white) and the Shaded style (where the color fills an
+# entire face - too dark or too saturated reads as visually harsh/muddy
+# across a whole model). Fixed rather than randomized/per-pair, per US-5's
+# "zero configuration" requirement - only the HUE varies per pair.
+_CATEGORY_PAIR_SATURATION = 0.62
+_CATEGORY_PAIR_LIGHTNESS = 0.45
 
 
 def _category_name_for_colorize(element):
@@ -1725,39 +1740,95 @@ def _category_name_for_colorize(element):
 
 
 def _category_pair_key(clash_result):
-    """Stable dict key for one clash's (host category, link category) pair.
-    Host and link names are kept in their natural (host, link) order rather
-    than order-normalized/sorted against each other - within a single
-    ClashFlag run a given category never swaps which side it's found on, so
-    this is already consistent, and "Host: Structural Framing <-> Link:
-    Duct" reads more naturally than an alphabetically-normalized pair would.
+    """Stable, ORDER-INDEPENDENT dict key for one clash's category pair.
+
+    Returns the host-side and link-side category names as a sorted 2-tuple,
+    NOT in (host, link) order - see CONTEXT.md's "Category Pair" glossary
+    entry. Which category lands on "host" vs. "link" is purely an accident
+    of which file happened to be open as host that day, not anything about
+    the real-world clash - a Walls/Air-Terminals clash must produce the same
+    key (and therefore the same color) whichever side is host. Keeping the
+    two names in natural (host, link) order, as an earlier version of this
+    function did, was exactly this bug: the same pairing got two different
+    dict keys - and two different colors - depending on host/link direction.
     """
-    return (
+    return tuple(sorted([
         _category_name_for_colorize(clash_result.host_element),
         _category_name_for_colorize(clash_result.link_element),
+    ]))
+
+
+def _stable_hash_int(text):
+    """Deterministic hash of `text` into a non-negative int, stable across
+    processes, runs, and machines - unlike Python's built-in `hash()`, which
+    (for str, since Python 3.3's hash randomization / PYTHONHASHSEED) is
+    salted per-process specifically to make it UNPREDICTABLE run-to-run.
+    Using the builtin here would silently violate US-5's "same pair, same
+    color, every run" requirement - two engineers (or two sessions) could see
+    different colors for the identical Walls/Air-Terminals pairing. MD5 over
+    the UTF-8 encoded text is a pure function of its input bytes only, with
+    no such salt, and is more than adequate here since this is a visual
+    bucketing aid, not a security or uniqueness guarantee.
+    """
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _color_for_category_pair(pair_key):
+    """Deterministic Color for an order-independent category pair key (see
+    `_category_pair_key`), derived by hashing the pair directly into a hue
+    rather than looking one up in a small fixed, hand-picked palette.
+
+    The two category names are joined with a separator character ("|") that
+    is vanishingly unlikely to appear inside a Revit category display name,
+    so e.g. ("Air Terminals", "Walls") hashes as a single distinct string
+    rather than accidentally colliding with some other pair whose names
+    happen to concatenate the same way. The resulting hash mod 360 gives a
+    hue; fixed `_CATEGORY_PAIR_SATURATION`/`_CATEGORY_PAIR_LIGHTNESS`
+    constants (see their own comment) supply the rest of an HLS color, which
+    `colorsys.hls_to_rgb` converts to 0.0-1.0 float RGB. Values are clamped
+    into [0, 255] before rounding to guard against float rounding pushing a
+    channel a hair outside that range (e.g. 255.00000000001).
+
+    This has no fixed "number of colors" ceiling the way the old cycled
+    10-color palette did - it degrades gracefully (two unrelated pairs can
+    still land on similar-looking hues by chance, same as any hash-based
+    bucketing) rather than deterministically colliding past a hard-coded
+    count, and needs no stored/persisted table: it is a pure function of the
+    pair's own name, recomputed fresh every call, per US-5's
+    zero-configuration requirement.
+    """
+    pair_text = "|".join(pair_key)
+    hue_degrees = _stable_hash_int(pair_text) % 360
+    hue_fraction = hue_degrees / 360.0
+    red, green, blue = colorsys.hls_to_rgb(
+        hue_fraction, _CATEGORY_PAIR_LIGHTNESS, _CATEGORY_PAIR_SATURATION
     )
+
+    def _to_byte(channel):
+        return int(round(max(0.0, min(1.0, channel)) * 255))
+
+    return Color(_to_byte(red), _to_byte(green), _to_byte(blue))
 
 
 def _build_category_pair_color_map(clash_results):
-    """Deterministic (host_category, link_category) -> Color map, stable
-    across repeated calls for the SAME clash_results CONTENT regardless of
-    the ORDER those results happen to be in.
+    """Deterministic, order-independent category-pair -> Color map.
 
-    Distinct pairs are collected into a set and then sorted alphabetically
-    before being zipped against the fixed palette by position - so the
-    mapping depends only on WHICH pairs are present, never on the order
-    run_interference_check/find_clashing_pairs happened to produce them in.
-    Colors cycle (modulo) once there are more distinct pairs than palette
-    entries - beyond _CATEGORY_PAIR_COLOR_PALETTE's length, some pairs will
-    share a color. That's an acceptable degradation (still internally
-    consistent per pair within one colorize toggle) rather than a hard cap
-    on how many distinct pairs can be colorized at once.
+    Each distinct pair's Color (`_color_for_category_pair`) is a PURE
+    function of that pair's own sorted name alone - never of which other
+    pairs are present in `clash_results`, how many there are, or what order
+    they happen to appear in. This replaces the old approach (collect
+    distinct pairs, sort them alphabetically, and cycle a fixed 10-color
+    palette by index), which meant a pair's color could change simply
+    because a DIFFERENT pair started or stopped appearing in the result set
+    (shifting everyone's index), and which silently collided once a model
+    had more than 10 distinct pairs at once. Hashing each pair independently
+    into the full hue space has no such ceiling and needs no stored table -
+    the same pair name always hashes to the same color, in any model, on any
+    run, with zero configuration.
     """
-    distinct_pairs = sorted(set(_category_pair_key(cr) for cr in clash_results))
-    return {
-        pair: _CATEGORY_PAIR_COLOR_PALETTE[index % len(_CATEGORY_PAIR_COLOR_PALETTE)]
-        for index, pair in enumerate(distinct_pairs)
-    }
+    distinct_pairs = set(_category_pair_key(cr) for cr in clash_results)
+    return {pair: _color_for_category_pair(pair) for pair in distinct_pairs}
 
 
 def _find_solid_fill_pattern_id(host_doc):
@@ -1803,11 +1874,11 @@ def _colorize_settings_for(color, solid_fill_pattern_id):
 
 
 def apply_colorize_overrides(clash_results, host_doc, active_view):
-    """Apply a per-(host_category, link_category)-pair color override to
-    every HOST-SIDE element across `clash_results`, in `active_view`. See
-    this module's "COLORIZE BY CATEGORY" section header comment (and the
-    module docstring's "ADDED IN 1005" section) for why link-side elements
-    are deliberately NOT touched here.
+    """Apply a per-category-pair (order-independent - see `_category_pair_key`)
+    color override to every HOST-SIDE element across `clash_results`, in
+    `active_view`. See this module's "COLORIZE BY CATEGORY" section header
+    comment (and the module docstring's "ADDED IN 1005" section) for why
+    link-side elements are deliberately NOT touched here.
 
     Returns a dict {ElementId.IntegerValue: OverrideGraphicSettings} - the
     PRE-EXISTING override for every host element this call touches, captured
