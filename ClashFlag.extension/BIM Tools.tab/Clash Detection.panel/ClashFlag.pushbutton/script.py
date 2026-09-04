@@ -481,7 +481,7 @@ LINK_CATEGORY = BuiltInCategory.OST_DuctCurves
 # it appears in the Project Browser / Manage Links) in whatever model this is
 # first run against. If no loaded link matches, the picker simply opens with
 # no link pre-checked - it's a convenience default, not a requirement.
-LINKED_MODEL_INSTANCE_NAME = "NUPCO-STRUCT-LINK.rvt"
+LINKED_MODEL_INSTANCE_NAME = "SAMPLE-STRUCT-LINK.rvt"
 
 # Floating-point noise guards ONLY - NOT a clash tolerance / near-miss feature
 # (explicitly out of scope for v1, see specs/clash-flag.md). Both values are

@@ -195,7 +195,7 @@ elements" per option 3, so the spec matches shipped scope. Closing.
 ## Reopened: live-testing bug, unresolved, paused for tomorrow (2026-09-04)
 
 Real bug found running the deployed extension in actual Revit 2024.3
-(NPC-RCC-3DM-BIM-STR-ER3-0001.rvt): clicking "Colorize clashes by category"
+(SAMPLE-STR-MODEL-0001.rvt): clicking "Colorize clashes by category"
 does not visibly check the box and no colors change. Diagnosed live via a
 Revit MCP connection (`send_code_to_revit`, C# executed directly in the
 user's running Revit process) rather than guessing — findings, in order:
