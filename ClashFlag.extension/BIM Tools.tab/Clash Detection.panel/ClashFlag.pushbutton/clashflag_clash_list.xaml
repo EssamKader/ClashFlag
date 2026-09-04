@@ -19,8 +19,19 @@
     ClashListBox is deliberately left EMPTY here, same "populate from Python"
     pattern the scope picker's HostCategoriesStack/LinksStack use: the actual
     list of clashes is only known once a run has completed, so
-    ClashListWindow.__init__ adds one string item per ClashResult to
+    ClashListWindow.__init__ adds one row per ClashResult to
     ClashListBox.Items at construction time.
+
+    T-10 / ticket 1010 (US-8, Legend): each row item is no longer a bare
+    string - ClashListWindow._build_clash_list_row (script.py) builds a small
+    horizontal StackPanel per row (a colored Border "swatch" for that clash's
+    category-pair color, from T-8's _color_for_category_pair, plus the same
+    describe() label TextBlock this used to show as plain text) and adds THAT
+    as the item. No XAML change was needed for this - ClashListBox stays
+    empty here exactly as before; only what Python puts into its Items
+    collection changed. SelectedIndex-based navigation (click-to-select,
+    Previous/Next) is unaffected either way, since it only ever depends on
+    integer index, never on what type of object each Items entry holds.
 
     Opened with .Show() (modeless), not .ShowDialog() like the scope picker -
     see ClashListWindow's docstring in clashflag_runner.py for why (US-4

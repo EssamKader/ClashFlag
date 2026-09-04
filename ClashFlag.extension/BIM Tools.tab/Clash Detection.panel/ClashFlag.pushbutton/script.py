@@ -223,6 +223,32 @@ header comment as not independently re-verified THIS session, the same
 spirit as this file's other "no live Revit session available" flags, but
 for the API-shape question specifically rather than live runtime behavior.
 
+ADDED IN 1010 (T-10): a per-row color swatch in the clash list itself (US-8,
+"Legend"), via ``ClashListWindow.__init__``'s item-population loop now adding
+``_build_clash_list_row(clash_result)`` (a small ``Border`` swatch + the
+existing ``describe()`` label ``TextBlock``, in a horizontal ``StackPanel``)
+to ``ClashListBox.Items`` instead of the bare ``clash_result.describe()``
+string it used to add - see the "LEGEND SWATCHES" section below (right above
+``ClashListWindow``) for ``_wpf_color_for_category_pair``/
+``_build_clash_list_row`` themselves. The swatch color is produced by
+calling T-8's ``_color_for_category_pair(_category_pair_key(clash_result))``
+DIRECTLY (never a re-derived/approximated hash), so the legend can never
+show a color that disagrees with what Colorize (T-5) would actually apply -
+and it shows what a clash's category pair WOULD colorize to regardless of
+whether the Colorize checkbox is currently on, since it's a legend for the
+mapping itself, not a live indicator of applied overrides. Purely a
+WPF-construction + read-only color lookup addition: no Revit API call, no
+``_revit_api_bridge`` involvement, and no ``Transaction`` was needed or
+added, and neither the Isolate (1009) nor Colorize (1005) checkbox handlers
+were touched. ``ClashListBox.Items`` now holds ``StackPanel`` (a
+``UIElement``) entries rather than plain strings, but every piece of
+navigation logic that reads from it - ``_on_list_selection_changed``,
+``_set_current_index``, ``_current_clash_result`` - keys exclusively off
+``ClashListBox.SelectedIndex``, an integer position, and never off the
+item's own type or content, so this required no change to any of that
+existing logic; see tickets/1010-clash-list-legend-swatches.md's
+"Implementation" section for how this was verified.
+
 RESEARCHED, NOT GUESSED - IMPORTANT LIMITATION: this ticket's obvious literal
 ask ("apply OverrideGraphicSettings to every host_element AND every
 link_element") turns out to be impossible for the link_element half via any
@@ -400,8 +426,24 @@ from Autodesk.Revit.DB import (
 )
 from Autodesk.Revit.UI import ExternalEvent, IExternalEventHandler
 from System.Collections.Generic import List
-from System.Windows import FontStyles, FontWeights, TextWrapping, Thickness
-from System.Windows.Controls import CheckBox, StackPanel, TextBlock
+from System.Windows import (
+    FontStyles,
+    FontWeights,
+    TextWrapping,
+    Thickness,
+    VerticalAlignment,
+)
+from System.Windows.Controls import Border, CheckBox, Orientation, StackPanel, TextBlock
+# T-10 (ticket 1010): System.Windows.Media.Color/SolidColorBrush for the
+# per-row legend swatch. Aliased to `MediaColor` because
+# `Autodesk.Revit.DB.Color` (already imported above, plain `Color`) and
+# `System.Windows.Media.Color` are two entirely unrelated types that happen
+# to share a name - a Revit Color is a 0-255-int-channel struct with no WPF
+# meaning at all, and a WPF Color has its own separate 0-255-byte-channel
+# representation understood by SolidColorBrush - see
+# `_wpf_color_for_category_pair` below for the explicit, byte-by-byte
+# conversion between the two (never an implicit cast, since none exists).
+from System.Windows.Media import Brushes, Color as MediaColor, SolidColorBrush
 
 from pyrevit import revit, script, forms
 
@@ -2157,6 +2199,88 @@ def _exit_temporary_isolate(host_doc, view):
 _open_clash_list_windows = []
 
 
+# ---------------------------------------------------------------------------
+# LEGEND SWATCHES (T-10 / ticket 1010)
+#
+# US-8: a small color swatch next to each ClashListBox row, showing what
+# color that clash's category pair WOULD colorize to (via T-8's
+# order-independent, hash-based `_color_for_category_pair`) - a static,
+# always-visible legend for the color-to-meaning mapping, regardless of
+# whether the Colorize checkbox (T-5/1005) is currently on or off. Purely a
+# read-only lookup plus WPF visual construction - no Revit API calls, no
+# `_revit_api_bridge` involvement, no Transaction, and no changes to the
+# Isolate/Colorize checkbox handlers.
+#
+# APPROACH CHOICE: rather than introducing a DataTemplate/binding-based
+# ListBox (this codebase has no MVVM/INotifyPropertyChanged convention
+# anywhere - ClashResult, ScopeSelection, etc. are all plain, non-bindable
+# Python objects), each row's visual (a small colored `Border` swatch plus
+# the existing `describe()` label `TextBlock`, side by side in a horizontal
+# `StackPanel`) is built directly in Python and added AS THE ITEM ITSELF to
+# `ClashListBox.Items`, exactly the way `ScopePickerWindow` already builds
+# `CheckBox`/`TextBlock`/`StackPanel` controls in code instead of static
+# XAML (see `_build_host_categories_ui`/`_build_one_link_block` above) -
+# this is the file's own established, least-disruption pattern for "the
+# content isn't knowable until run time" UI, not a new one. WPF's
+# `ItemsControl` accepts any object as an item, including a `UIElement`
+# (which a `StackPanel` is) - it is used directly as that row's visual,
+# wrapped in an implicitly-generated `ListBoxItem` container exactly like a
+# plain string item would be. Crucially, this changes NOTHING about
+# `ClashListBox.SelectedIndex`/index-based navigation: `_on_list_selection_
+# changed`/`_set_current_index`/`_current_clash_result` all key off
+# `SelectedIndex`, an integer position, never off the item's own type or
+# content - see the "Implementation" section of tickets/1010-clash-list-
+# legend-swatches.md for how this was specifically verified.
+# ---------------------------------------------------------------------------
+
+
+def _wpf_color_for_category_pair(clash_result):
+    """Convert `clash_result`'s category-pair color - an
+    `Autodesk.Revit.DB.Color` (0-255 int R/G/B, from T-8's
+    `_color_for_category_pair`) - into a `System.Windows.Media.Color` (also
+    0-255 byte R/G/B, but a completely separate .NET type with no implicit
+    conversion between the two) suitable for a WPF `SolidColorBrush`. Calls
+    `_color_for_category_pair(_category_pair_key(clash_result))` directly -
+    the exact T-8 functions, not a re-derived/approximated hash - so the
+    legend can never drift out of sync with what Colorize (T-5) actually
+    applies to the model.
+    """
+    revit_color = _color_for_category_pair(_category_pair_key(clash_result))
+    return MediaColor.FromRgb(revit_color.Red, revit_color.Green, revit_color.Blue)
+
+
+def _build_clash_list_row(clash_result):
+    """Build one `ClashListBox` row's visual for `clash_result`: a small
+    solid-color swatch (the US-8 legend) immediately followed by the
+    existing `clash_result.describe()` label text, laid out in a horizontal
+    `StackPanel`. This is a purely cosmetic, static addition - it reflects
+    what `clash_result`'s category pair WOULD colorize to (see
+    `_wpf_color_for_category_pair`), independent of whether Colorize is
+    currently checked, and adds no click/toggle behavior of its own beyond
+    what the ListBox row already had (selecting the row still selects this
+    clash, exactly as before).
+    """
+    swatch = Border()
+    swatch.Width = 14
+    swatch.Height = 14
+    swatch.Margin = Thickness(0, 0, 6, 0)
+    swatch.Background = SolidColorBrush(_wpf_color_for_category_pair(clash_result))
+    swatch.BorderBrush = Brushes.Black
+    swatch.BorderThickness = Thickness(1)
+    swatch.VerticalAlignment = VerticalAlignment.Center
+
+    label = TextBlock()
+    label.Text = clash_result.describe()
+    label.TextWrapping = TextWrapping.Wrap
+    label.VerticalAlignment = VerticalAlignment.Center
+
+    row = StackPanel()
+    row.Orientation = Orientation.Horizontal
+    row.Children.Add(swatch)
+    row.Children.Add(label)
+    return row
+
+
 class ClashListWindow(forms.WPFWindow):
     """Modeless T-3 clash list / navigation panel (US-3).
 
@@ -2267,7 +2391,12 @@ class ClashListWindow(forms.WPFWindow):
         self.isolate_view_id = None
 
         for clash_result in self.clash_results:
-            self.ClashListBox.Items.Add(clash_result.describe())
+            # T-10 (US-8): each row is now a small Legend swatch (see
+            # `_build_clash_list_row`) plus the same describe() label text
+            # this used to add as a bare string - SelectedIndex-based
+            # navigation below is unaffected (see the "LEGEND SWATCHES"
+            # section header comment above `_build_clash_list_row`).
+            self.ClashListBox.Items.Add(_build_clash_list_row(clash_result))
 
         self.ClashListBox.SelectionChanged += self._on_list_selection_changed
 
