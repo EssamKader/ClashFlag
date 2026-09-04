@@ -34,6 +34,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <TextBlock Grid.Row="0"
@@ -63,7 +64,27 @@
                   Unchecked="colorize_checkbox_unchecked"
                   ToolTip="Color-codes each clash's HOST-side element by its host/link category pair, consistently across the current result set. Linked-side elements can't be colorized this way - Revit has no API to override an individual linked element's graphics from a host view."/>
 
-        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right">
+        <!--
+        T-9 / ticket 1009 (US-7): Isolate toggle. Applies to the CURRENT
+        clash only (unlike ColorizeCheckBox above, which applies to the
+        whole result set at once) - hides everything else in the active
+        view and always also selects/highlights both elements, since the
+        link-side element can't itself be isolated (same researched Revit
+        API limitation as colorize's host-only scope). See
+        ClashListWindow.isolate_checkbox_checked/_unchecked in script.py for
+        the full lifecycle - mirrors ColorizeCheckBox's exact
+        apply-on-check/clear-on-uncheck/clear-on-Closed pattern, but also
+        re-applies on every Next/Previous/list-click navigation while
+        checked, since "the current clash" itself changes underneath it.
+        -->
+        <CheckBox Grid.Row="4" x:Name="IsolateCheckBox"
+                  Content="Isolate current clash"
+                  Margin="0,0,0,8"
+                  Checked="isolate_checkbox_checked"
+                  Unchecked="isolate_checkbox_unchecked"
+                  ToolTip="Hides everything in the active view except this clash's HOST-side element, and always also selects/highlights both elements (the link-side element can't be isolated this way - Select keeps it findable). Moving to a different clash replaces the isolation; turning this off restores full visibility."/>
+
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="PreviousButton" Content="Previous" Width="90" Height="28" Margin="0,0,8,0"
                     Click="previous_button_click"/>
             <Button x:Name="NextButton" Content="Next" Width="90" Height="28" Margin="0,0,8,0"

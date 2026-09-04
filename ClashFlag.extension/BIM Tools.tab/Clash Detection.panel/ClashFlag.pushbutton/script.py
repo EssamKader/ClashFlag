@@ -188,6 +188,41 @@ Python's built-in ``hash()`` was deliberately NOT used (it is salted per-
 process via ``PYTHONHASHSEED`` since Python 3.3, which would have silently
 broken the "same pair, same color, every run" requirement).
 
+ADDED IN 1009 (T-9): an "Isolate current clash" toggle (US-7), via a new
+``IsolateCheckBox`` in ``ClashListWindow`` (see
+``clashflag_clash_list.xaml``) and its ``isolate_checkbox_checked`` /
+``isolate_checkbox_unchecked`` handlers - see the "ISOLATE CURRENT CLASH"
+section below for ``_isolate_host_element`` / ``_exit_temporary_isolate``
+(the two ``View.IsolateElementsTemporary`` / ``View.
+DisableTemporaryViewMode`` Transaction-wrapped helpers) and
+``ClashListWindow._apply_isolate_for_clash`` / ``_clear_isolate_if_active``
+(the checkbox lifecycle itself, mirroring 1005's colorize checkbox
+lifecycle shape exactly, per the ticket). Unlike colorize (a one-shot
+apply-to-the-whole-result-set toggle), Isolate applies to only the CURRENT
+clash and must be RE-applied every time the current clash changes while the
+toggle stays on - so, per the ticket's explicit instruction, this reuses
+ticket 1003/1004's existing ``on_selection_changed`` extension hook
+(extended, not duplicated with a second navigation hook) to replace the
+isolation on Next/Previous/list-click navigation. Because the link-side
+element still can't be isolated (the exact same cross-document API ceiling
+1005 already researched for graphic overrides - see "RESEARCHED, NOT
+GUESSED - IMPORTANT LIMITATION" just below), turning Isolate on always also
+calls ``select_clash_pair`` (T-4/1004) so the link-side element stays
+findable inside the still-fully-visible link model. Fully independent of
+Colorize (US-5) - neither feature's code reads or writes the other's state.
+Every Revit-API-touching call this ticket adds is routed through the
+existing ``_revit_api_bridge`` for the same "SECOND RESEARCHED-NOT-GUESSED
+SUBTLETY" reason as camera fly-to and colorize - see that section further
+below. This session's tool set did not include a web-fetch capability
+(unlike 1004/1005/1008), so the exact ``IsolateElementsTemporary``/
+``DisableTemporaryViewMode``/``IsInTemporaryViewMode``/``TemporaryViewMode``
+API surface used here is drawn from established, previously-verified-in-
+production Revit API knowledge rather than a live doc re-fetch this
+session - flagged explicitly in the "ISOLATE CURRENT CLASH" section's own
+header comment as not independently re-verified THIS session, the same
+spirit as this file's other "no live Revit session available" flags, but
+for the API-shape question specifically rather than live runtime behavior.
+
 RESEARCHED, NOT GUESSED - IMPORTANT LIMITATION: this ticket's obvious literal
 ask ("apply OverrideGraphicSettings to every host_element AND every
 link_element") turns out to be impossible for the link_element half via any
@@ -318,6 +353,13 @@ open their own single, descriptively-named ``Transaction`` around exactly
 their batch of ``SetElementOverrides`` calls, with a try/except around the
 whole batch that rolls back on failure rather than leaving a half-applied
 transaction open.
+
+1009's Isolate toggle is the SECOND: ``View.IsolateElementsTemporary`` /
+``View.DisableTemporaryViewMode`` also write persisted (if normally
+short-lived) view state - Temporary Isolate mode - and both are documented
+as requiring an open, modifiable Transaction, same as colorize's overrides.
+See the "ISOLATE CURRENT CLASH" section below for the full reasoning and
+its own two Transaction-wrapped helpers.
 """
 
 import colorsys
@@ -350,6 +392,7 @@ from Autodesk.Revit.DB import (
     RevitLinkInstance,
     Solid,
     SolidUtils,
+    TemporaryViewMode,
     Transaction,
     View3D,
     ViewDetailLevel,
@@ -1981,6 +2024,125 @@ def clear_colorize_overrides(host_doc, view, previous_overrides):
         transaction.Commit()
 
 
+# ---------------------------------------------------------------------------
+# ISOLATE CURRENT CLASH (T-9 / ticket 1009)
+#
+# US-7: an opt-in "Isolate" toggle that hides everything in the active view
+# except the CURRENT clash's host-side element, and always also runs Select
+# (select_clash_pair, above, from T-4/1004) so the un-isolatable link-side
+# element stays findable. Moving to a different clash while Isolate is on
+# REPLACES the isolation; turning it off, or closing the panel while it's
+# on, restores full visibility. See ClashListWindow.isolate_checkbox_checked/
+# _unchecked and _apply_isolate_for_clash/_clear_isolate_if_active (below,
+# in the "CLASH LIST PANEL" section) for the checkbox lifecycle itself -
+# mirrors 1005's colorize checkbox lifecycle shape exactly, per the ticket.
+# Only the two small Transaction-wrapped helper functions live up here,
+# next to the other Revit-API-touching helpers this file already has.
+# ---------------------------------------------------------------------------
+#
+# API CHOICE - RECALLED FROM ESTABLISHED REVIT API KNOWLEDGE, FLAGGED AS NOT
+# INDEPENDENTLY RE-VERIFIED THIS SESSION: unlike tickets 1004/1005/1008 (which
+# had WebFetch/WebSearch tools available to cross-check revitapidocs.com and
+# forum sources live), this session's tool set does not include a web-fetch
+# capability - there is no way to independently re-confirm these exact method
+# names/signatures against a live doc page from inside this sandbox. What
+# follows is based on well-established, previously-verified-in-production
+# Revit API surface (the same "temporary hide/isolate" API used by countless
+# real add-ins, including code the author has personally shipped before):
+#   - ``View.IsolateElementsTemporary(ICollection<ElementId> elementIds)`` -
+#     puts the view into Temporary Isolate mode showing ONLY the given
+#     elements. Calling it AGAIN while the view is already in that mode
+#     REPLACES the isolated set with the new one - it does not accumulate
+#     across calls. This is exactly the "moving to a different clash
+#     replaces the isolation, never accumulates" behavior US-7 asks for, and
+#     is why re-isolating for a newly-current clash needs no separate
+#     "clear, then re-apply" step - see _isolate_host_element's own
+#     docstring below.
+#   - ``View.IsInTemporaryViewMode(TemporaryViewMode temporaryViewMode)`` -
+#     returns whether the view currently has that specific temporary mode
+#     active.
+#   - ``View.DisableTemporaryViewMode(TemporaryViewMode temporaryViewMode)`` -
+#     exits that mode, restoring full visibility. Per this same established
+#     knowledge, calling this for a mode the view is NOT currently in raises
+#     rather than silently no-op-ing - which is why _exit_temporary_isolate
+#     below guards with IsInTemporaryViewMode first, not fire-and-catch.
+#   - ``TemporaryViewMode.TemporaryHideIsolate`` - the specific enum member
+#     covering BOTH Temporary Hide and Temporary Isolate (the same mode
+#     Revit's own View Control Bar "Temporary Hide/Isolate" flyout drives) -
+#     used consistently for both the apply and clear calls below, since a
+#     mode can only be disabled with the exact member it was enabled under.
+# TRANSACTED, NOT TRANSIENT UI STATE: unlike ``UIView.ZoomAndCenterRectangle``
+# or ``Selection.SetReferences`` (both confirmed, in the "CAMERA FLY-TO-CLASH"
+# section above, to be transient on-screen state needing no Transaction),
+# Temporary Isolate mode is a persisted (if normally short-lived) piece of
+# VIEW state - it survives a document save until explicitly cleared, and
+# both enabling and disabling it are documented as requiring an open,
+# modifiable Transaction (attempting either outside one raises
+# ``InvalidOperationException``, the same family of exception the module
+# docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY" section already
+# describes for other Revit API calls made outside a valid context/
+# transaction). Both helpers below therefore open their own single,
+# descriptively-named Transaction, with a try/except that rolls back on
+# failure rather than leaving a half-applied transaction open, per project
+# ground rules - exactly like ``apply_colorize_overrides``/
+# ``clear_colorize_overrides`` already do for their own single-batch
+# Transactions.
+# ---------------------------------------------------------------------------
+
+
+def _isolate_host_element(host_doc, view, host_element_id):
+    """Put `view` into Temporary Isolate mode showing ONLY `host_element_id`
+    - the "hides everything ... except the current clash's host-side
+    element" half of US-7. Only ever called with a HOST-document element id
+    (the link-side element can't be isolated this way at all - same Revit
+    API ceiling this module's colorize section already researched for
+    graphic overrides; Select is what keeps the link-side element findable
+    instead - see select_clash_pair above).
+
+    Safe to call again for a DIFFERENT `host_element_id` while `view` is
+    already in Temporary Isolate mode from a previous call - per this
+    section's header comment, ``IsolateElementsTemporary`` replaces the
+    isolated set rather than accumulating it, so navigating to a new clash
+    while Isolate is on can just call this again for the new clash's host
+    element with no separate "clear first" step.
+    """
+    id_list = List[ElementId]([host_element_id])
+    transaction = Transaction(host_doc, "ClashFlag: isolate current clash")
+    transaction.Start()
+    try:
+        view.IsolateElementsTemporary(id_list)
+    except Exception:
+        transaction.RollBack()
+        raise
+    else:
+        transaction.Commit()
+
+
+def _exit_temporary_isolate(host_doc, view):
+    """Exit Temporary Isolate mode on `view`, restoring full visibility -
+    the "turning Isolate off ... immediately restores the full view" half
+    of US-7. Guards with ``IsInTemporaryViewMode`` first (see this section's
+    header comment for why) so this is a true no-op - no Transaction even
+    opened - when `view` isn't actually in that mode (e.g. a user manually
+    exited it via Revit's own View Control Bar while ClashFlag's checkbox
+    was still checked; or a redundant call from a second near-simultaneous
+    clear, though ``ClashListWindow._clear_isolate_if_active``'s own
+    ``isolate_active`` guard already prevents that particular case from
+    reaching here at all).
+    """
+    if not view.IsInTemporaryViewMode(TemporaryViewMode.TemporaryHideIsolate):
+        return
+    transaction = Transaction(host_doc, "ClashFlag: exit isolate mode")
+    transaction.Start()
+    try:
+        view.DisableTemporaryViewMode(TemporaryViewMode.TemporaryHideIsolate)
+    except Exception:
+        transaction.RollBack()
+        raise
+    else:
+        transaction.Commit()
+
+
 # Kept alive here purely to prevent .NET/CLR garbage collection of an open
 # ClashListWindow. Unlike ScopePickerWindow (opened with the blocking
 # ShowDialog(), which keeps its own frame alive on the call stack until
@@ -2088,6 +2250,22 @@ class ClashListWindow(forms.WPFWindow):
         self.colorize_previous_overrides = {}
         self.colorize_view_id = None
 
+        # T-9 / ticket 1009 (US-7) state. Mirrors colorize_active's/
+        # colorize_view_id's exact shape and reasoning (see the comment just
+        # above), with one addition: unlike colorize (a single one-shot
+        # apply per Checked event), isolate can be RE-applied many times
+        # over one "session" - once per Next/Previous/list-click navigation
+        # while the checkbox stays checked (see on_selection_changed below).
+        # `isolate_view_id` is therefore not just "captured at apply time,
+        # not re-read at clear time" like colorize_view_id - it is captured
+        # ONCE, at the FIRST apply of a session, and then REUSED (never
+        # re-read from doc.ActiveView) for every later re-apply in that same
+        # session too, so a mid-session active-view switch can't strand an
+        # earlier isolated view with nothing left able to clear it. See
+        # _apply_isolate_for_clash's own docstring for the full reasoning.
+        self.isolate_active = False
+        self.isolate_view_id = None
+
         for clash_result in self.clash_results:
             self.ClashListBox.Items.Add(clash_result.describe())
 
@@ -2097,9 +2275,10 @@ class ClashListWindow(forms.WPFWindow):
             self._set_current_index(0)
         else:
             self._update_status_and_buttons()
-            # Nothing to colorize either - matches the disabled Previous/
-            # Next buttons' "no clashes" treatment above.
+            # Nothing to colorize or isolate either - matches the disabled
+            # Previous/Next buttons' "no clashes" treatment above.
             self.ColorizeCheckBox.IsEnabled = False
+            self.IsolateCheckBox.IsEnabled = False
 
     def colorize_checkbox_checked(self, sender, args):
         """Turn colorize-by-category ON for the WHOLE current
@@ -2207,6 +2386,198 @@ class ClashListWindow(forms.WPFWindow):
 
         _revit_api_bridge.raise_action(_clear)
 
+    def isolate_checkbox_checked(self, sender, args):
+        """Turn Isolate ON (US-7 / ticket 1009) for the CURRENT clash - see
+        this module's "ISOLATE CURRENT CLASH" section and
+        _apply_isolate_for_clash's own docstring for what actually happens
+        and exactly which view it targets.
+
+        Like every other ClashListWindow handler, this runs OUTSIDE a valid
+        Revit API execution context (see the module docstring's "SECOND
+        RESEARCHED-NOT-GUESSED SUBTLETY" section) - all it does directly is
+        read plain Python/already-held state (`self.current_index`,
+        `self.clash_results`) and hand off to `_apply_isolate_for_clash`,
+        which itself queues the actual Revit-API-touching work through
+        `_revit_api_bridge.raise_action(...)`. Nothing Revit-API-touching is
+        ever called directly from this method's own body.
+        """
+        clash_result = self._current_clash_result()
+        if clash_result is None:
+            # Shouldn't normally happen - IsolateCheckBox is disabled
+            # whenever clash_results is empty (see __init__) - but guarded
+            # defensively rather than assumed, same posture as
+            # colorize_checkbox_checked's handling of unexpected states.
+            self.IsolateCheckBox.IsChecked = False
+            return
+        self._apply_isolate_for_clash(clash_result)
+
+    def isolate_checkbox_unchecked(self, sender, args):
+        """Turn Isolate OFF: exit Temporary Isolate mode on whichever view
+        Isolate is currently active on, restoring full visibility there -
+        see `_clear_isolate_if_active`'s docstring for exactly which view
+        and why."""
+        self._clear_isolate_if_active()
+
+    def _apply_isolate_for_clash(self, clash_result):
+        """Queue the bridge action that isolates `clash_result`'s host
+        element and Selects both its elements (US-7's "Isolate always also
+        runs Select") - shared by `isolate_checkbox_checked` (the FIRST
+        apply of an Isolate "session") and `on_selection_changed` (every
+        RE-apply triggered by Next/Previous/list-click navigation while
+        `self.isolate_active` is already True). One shared implementation
+        means both call sites can never drift apart on what "isolate this
+        clash" actually does - the same reason `_clear_colorize_if_active`
+        is shared between the Unchecked handler and the window's Closed
+        handler.
+
+        VIEW CHOICE - CAPTURE ONCE PER SESSION, DON'T RE-READ "WHATEVER'S
+        ACTIVE NOW" ON EVERY RE-APPLY: the FIRST call in a session
+        (`self.isolate_view_id` is still None, i.e. Isolate was just
+        checked) reads `doc.ActiveView` fresh, exactly like
+        `colorize_checkbox_checked` captures `colorize_view_id`. Every
+        SUBSEQUENT call in the SAME session (checkbox still checked,
+        `self.isolate_view_id` already set from that first call) re-resolves
+        and reuses that EXACT View by id - it does not read `doc.ActiveView`
+        again. This matters because `IsolateElementsTemporary` can be called
+        on any resolved View object regardless of whether it's the currently
+        active one, and blindly re-reading "whatever's active now" on every
+        navigation step would silently strand an EARLIER isolated view stuck
+        in Temporary Isolate mode forever the moment a user switches the
+        active view mid-session and then clicks Next: `isolate_view_id`
+        would get overwritten to point at the new view, and nothing would
+        ever go back and call `DisableTemporaryViewMode` on the abandoned
+        first one - not even closing the window, since `_clear_isolate_if_
+        active` only ever knows about the LAST view stored there. Reusing
+        one captured view for a whole session (extending colorize_view_id's
+        existing "capture at apply time, don't re-read at clear time"
+        pattern to also cover mid-session RE-apply, not just clear)
+        guarantees exactly one view is ever touched per session, and that
+        Unchecked/Closed can always find and clean up the one it touched.
+
+        No-ops (queues nothing) when `clash_result` is None - i.e. nothing
+        is currently "the current clash" (can only happen transiently, e.g.
+        `current_index` momentarily out of range) - there is nothing to
+        isolate.
+        """
+        if clash_result is None:
+            return
+
+        # None only on the very first apply of a session (see docstring
+        # above) - captured here, in the raw handler body, not inside the
+        # queued closure below: this is a plain read of an already-held
+        # Python attribute (an ElementId object created earlier, inside a
+        # valid context), not a new Revit API call, so it needs no bridge -
+        # the exact same reasoning colorize_checkbox_unchecked already
+        # relies on when it reads self.colorize_view_id outside the bridge.
+        reuse_view_id = self.isolate_view_id
+        is_first_apply_in_session = reuse_view_id is None
+
+        def _apply():
+            if reuse_view_id is not None:
+                view = doc.GetElement(reuse_view_id)
+                if view is None:
+                    output.print_md(
+                        "_ClashFlag: the view Isolate was applied to no "
+                        "longer exists - turning Isolate off._"
+                    )
+                    self.isolate_active = False
+                    self.isolate_view_id = None
+                    self.IsolateCheckBox.IsChecked = False
+                    return
+            else:
+                view = doc.ActiveView
+
+            try:
+                _isolate_host_element(doc, view, clash_result.host_element.Id)
+            except Exception as isolate_error:
+                output.print_md(
+                    "_ClashFlag: could not isolate this clash's host "
+                    "element: {0}_".format(isolate_error)
+                )
+                # Reset state and uncheck rather than leave Isolate marked
+                # "active" against a view it never actually succeeded in
+                # isolating - mirrors colorize_checkbox_checked's own
+                # failure handling (uncheck the box on apply failure).
+                self.isolate_active = False
+                self.isolate_view_id = None
+                self.IsolateCheckBox.IsChecked = False
+                return
+
+            self.isolate_active = True
+            self.isolate_view_id = view.Id
+            # Always also Select both elements (US-7) - the link-side
+            # element can't be isolated (same API ceiling as colorize's
+            # host-only override limitation), so Select keeps it findable
+            # inside the still-fully-visible link model.
+            select_clash_pair(clash_result, doc, uidoc)
+
+            if is_first_apply_in_session:
+                # Printed once per session (first check), not on every
+                # subsequent Next/Previous re-apply - matches
+                # reframe_active_view_on_clash's own "console note, not
+                # popup, since [failure] notes already fire on every
+                # navigation step" reasoning, taken one step further here:
+                # a routine SUCCESS note on every single step would drown
+                # out the genuinely useful per-step failure notes above.
+                output.print_md(
+                    "_ClashFlag: Isolate is ON - hides everything in this "
+                    "view except this clash's host-side element. The "
+                    "link-side element can't be isolated (same Revit API "
+                    "ceiling as colorize's host-only limitation), so "
+                    "Select keeps it findable too. Moving to a different "
+                    "clash replaces the isolation; turning Isolate off "
+                    "restores full visibility._"
+                )
+
+        _revit_api_bridge.raise_action(_apply)
+
+    def _clear_isolate_if_active(self):
+        """Shared by `isolate_checkbox_unchecked` above AND
+        `show_clash_list`'s Closed-event cleanup below - exact mirror of
+        `_clear_colorize_if_active`'s own shape and reasoning (a window
+        closed while Isolate is still on must not leave the model - here,
+        specifically the one view Isolate was applied to - stuck in
+        Temporary Isolate mode after this window's UI is gone). No-ops if
+        Isolate was never turned on, or was already cleared (e.g. a
+        still-in-flight `_apply_isolate_for_clash` bridge closure that
+        already reset this state after a re-apply failure, or Unchecked and
+        Closed both firing close together) - same double-fire safety
+        `_clear_colorize_if_active` already relies on.
+
+        State reset happens SYNCHRONOUSLY, immediately, here - not deferred
+        into the queued bridge closure - for the identical reason
+        `_clear_colorize_if_active`'s own docstring gives: a second
+        near-simultaneous call must see `isolate_active` already False and
+        no-op, rather than queue a second, redundant
+        `DisableTemporaryViewMode` call.
+        """
+        if not self.isolate_active:
+            return
+
+        view_id = self.isolate_view_id
+        self.isolate_active = False
+        self.isolate_view_id = None
+
+        def _clear():
+            view = doc.GetElement(view_id) if view_id else None
+            if view is None:
+                output.print_md(
+                    "_ClashFlag: the view Isolate was applied to no longer "
+                    "exists - its Temporary Isolate mode could not be "
+                    "explicitly cleared (it went away with the view "
+                    "itself)._"
+                )
+                return
+            try:
+                _exit_temporary_isolate(doc, view)
+            except Exception as clear_error:
+                output.print_md(
+                    "_ClashFlag: failed to fully exit Temporary Isolate "
+                    "mode: {0}_".format(clear_error)
+                )
+
+        _revit_api_bridge.raise_action(_clear)
+
     def _on_list_selection_changed(self, sender, args):
         """The one place ``current_index`` ever changes. Fires for direct
         user clicks on a list row AND for the ``SelectedIndex`` writes
@@ -2241,10 +2612,19 @@ class ClashListWindow(forms.WPFWindow):
         self.PreviousButton.IsEnabled = self.current_index > 0
         self.NextButton.IsEnabled = 0 <= self.current_index < total - 1
 
-    def _fire_selection_hook(self):
-        clash_result = None
+    def _current_clash_result(self):
+        """The ``ClashResult`` `self.current_index` currently points at, or
+        ``None`` if out of range (e.g. `current_index` is still -1 before
+        any clash is auto-selected, or `clash_results` is empty). Shared by
+        `_fire_selection_hook` (existing, 1003) and
+        `isolate_checkbox_checked` (new, 1009) so both read "the current
+        clash" exactly the same way."""
         if 0 <= self.current_index < len(self.clash_results):
-            clash_result = self.clash_results[self.current_index]
+            return self.clash_results[self.current_index]
+        return None
+
+    def _fire_selection_hook(self):
+        clash_result = self._current_clash_result()
         self.on_selection_changed(clash_result, self.current_index)
 
     def on_selection_changed(self, clash_result, index):
@@ -2256,9 +2636,23 @@ class ClashListWindow(forms.WPFWindow):
         this method in a subclass instead if you'd rather extend by
         inheritance. Ticket 1004 (camera fly-to) hooks in here; ticket 1005
         (colorize) deliberately does NOT - see the class docstring's
-        "colorize-by-category" note above."""
+        "colorize-by-category" note above.
+
+        T-9 / ticket 1009 (US-7) ALSO hooks in here, deliberately, rather
+        than inventing a second navigation hook (per that ticket's explicit
+        instruction): if Isolate is currently on, replace the isolation for
+        the newly-current clash - this is the ONE place "the current clash
+        changed" is ever signaled, regardless of whether the change came
+        from a list click, Next, Previous, or the initial auto-selection at
+        window-open (that initial call is harmless here since
+        `self.isolate_active` is always still False at that point - Isolate
+        is opt-in and can't have been checked before the window finished
+        constructing)."""
         if self.selection_changed_callback is not None:
             self.selection_changed_callback(clash_result, index)
+
+        if self.isolate_active:
+            self._apply_isolate_for_clash(clash_result)
 
     def next_button_click(self, sender, args):
         self._set_current_index(self.current_index + 1)
@@ -2302,6 +2696,12 @@ def show_clash_list(clash_results, selection_changed_callback=None):
         # clear them here using the exact same restore-previous-overrides
         # path the Unchecked handler uses, BEFORE forgetting the window.
         window._clear_colorize_if_active()
+        # T-9 / ticket 1009 instruction: same treatment for Isolate - don't
+        # leave the model's view stuck in Temporary Isolate mode after this
+        # window's UI is gone, using the exact same restore path
+        # isolate_checkbox_unchecked uses. Independent of the colorize call
+        # above - neither reads or writes the other's state.
+        window._clear_isolate_if_active()
         if window in _open_clash_list_windows:
             _open_clash_list_windows.remove(window)
 
