@@ -527,7 +527,7 @@ def _link_display_name(link_instance):
         return "<unnamed linked model>"
 
 
-def resolve_link_instance_by_id(host_doc, link_element_id):
+def resolve_link_instance_by_id(host_doc, link_element_id, deps):
     """Re-resolve a RevitLinkInstance from its ElementId at run time.
 
     Replaces the old name-based find_link_instance() lookup: the picker
@@ -541,10 +541,23 @@ def resolve_link_instance_by_id(host_doc, link_element_id):
     closed WPF dialog's fields still holding valid Revit API references, and
     it matches what ticket 1002 explicitly asks for ("by ElementId, not just
     name, since the picker will have concrete instances in hand").
+
+    T-12 (ticket 1012) fix: this function is reachable from inside
+    ``_RevitApiBridge.Execute()`` (via ``select_clash_pair`` and
+    ``_combined_host_space_bounding_box``), where EVERY bare module-level
+    name lookup - not just the directly delegate-invoked function's own -
+    hits a broken, near-empty scope (see tickets/1012-fix-deep-helper-
+    globals-crash.md's "Revised understanding of the root cause"). `deps`
+    (a `_HelperDeps` instance - see that ticket's section near
+    `_helper_deps`, below) is threaded through instead of referencing
+    `RevitLinkInstance`/`ClashFlagError` bare. Safe-context callers (e.g.
+    `run_interference_check`, called directly and synchronously from
+    `__main__`) pass `_helper_deps` explicitly too, for one single function
+    signature rather than two forked copies of the same logic.
     """
     element = host_doc.GetElement(link_element_id)
-    if not isinstance(element, RevitLinkInstance):
-        raise ClashFlagError(
+    if not isinstance(element, deps.RevitLinkInstance):
+        raise deps.ClashFlagError(
             "Selected link (id {0}) is no longer a valid RevitLinkInstance in "
             "the active document - it may have been deleted since the scope "
             "picker was shown. Re-run ClashFlag.".format(
@@ -554,17 +567,21 @@ def resolve_link_instance_by_id(host_doc, link_element_id):
     return element
 
 
-def resolve_link_document(link_instance):
+def resolve_link_document(link_instance, deps):
     """Return the loaded Document for `link_instance`, raising
     ClashFlagError if it isn't currently loaded (we need the linked document
     actually loaded/resolvable to read its geometry). The picker only offers
     checkboxes for links that were loaded when it opened, but a link can in
     principle be unloaded between then and now, so this is still checked
     here rather than assumed.
+
+    T-12 (ticket 1012) fix: see `resolve_link_instance_by_id`'s docstring
+    above - same reason, same `deps` pattern, for its own bare
+    `ClashFlagError` reference.
     """
     link_doc = link_instance.GetLinkDocument()
     if link_doc is None:
-        raise ClashFlagError(
+        raise deps.ClashFlagError(
             "Linked model '{0}' is not currently loaded (unloaded/unresolved "
             "link) - it may have been unloaded since the scope picker was "
             "shown. Load the link and re-run.".format(
@@ -764,7 +781,7 @@ def collect_candidate_solids(source_doc, categories, link_transform=None):
     return candidates, skipped_elements
 
 
-def _transform_all_corners(local_min, local_max, local_to_target_transform):
+def _transform_all_corners(local_min, local_max, local_to_target_transform, deps):
     """Return (target_min, target_max) - two ``XYZ`` points describing the
     smallest axis-aligned box, in the TARGET space, that fully contains the
     axis-aligned box [local_min, local_max] from some LOCAL space, given the
@@ -783,18 +800,31 @@ def _transform_all_corners(local_min, local_max, local_to_target_transform):
     already-reviewed technique for link-element bounding boxes instead of
     re-deriving a parallel (and possibly subtly different/wrong) version of
     it.
+
+    T-12 (ticket 1012) fix: this function is reachable from inside
+    ``_RevitApiBridge.Execute()`` (via ``_combined_host_space_bounding_box``),
+    where every bare module-level name lookup hits a broken, near-empty
+    scope - see the module's "HELPER DEPS CONTAINER" section further below
+    for the full explanation. `deps` (a `_HelperDeps` instance) replaces the
+    bare `XYZ` reference below. ``_outline_for_solid``'s OWN call site
+    (further down) runs in a perfectly safe context (plain detection-
+    pipeline execution, never through the bridge) and is not itself broken
+    today - it is updated to pass `deps` anyway (reading the safe, always-
+    correct module-level `_helper_deps` directly) purely so this function
+    keeps one signature instead of forking two copies of the same logic, per
+    the ticket's explicit instruction.
     """
     xs, ys, zs = [], [], []
     for x in (local_min.X, local_max.X):
         for y in (local_min.Y, local_max.Y):
             for z in (local_min.Z, local_max.Z):
-                corner = local_to_target_transform.OfPoint(XYZ(x, y, z))
+                corner = local_to_target_transform.OfPoint(deps.XYZ(x, y, z))
                 xs.append(corner.X)
                 ys.append(corner.Y)
                 zs.append(corner.Z)
 
-    target_min = XYZ(min(xs), min(ys), min(zs))
-    target_max = XYZ(max(xs), max(ys), max(zs))
+    target_min = deps.XYZ(min(xs), min(ys), min(zs))
+    target_max = deps.XYZ(max(xs), max(ys), max(zs))
     return target_min, target_max
 
 
@@ -829,7 +859,18 @@ def _outline_for_solid(solid):
     if bbox is None:
         return None
 
-    world_min, world_max = _transform_all_corners(bbox.Min, bbox.Max, bbox.Transform)
+    # T-12 (ticket 1012): `_transform_all_corners` now takes `deps` (see the
+    # "HELPER DEPS CONTAINER" section further below) for signature
+    # consistency with its OTHER call site
+    # (`_combined_host_space_bounding_box`, which genuinely runs through the
+    # broken-scope bridge) - this call site itself is always safe (plain
+    # detection-pipeline execution, never through the bridge), so it reads
+    # `_helper_deps` bare directly rather than needing its own `deps`
+    # parameter threaded all the way through `_outline_for_solid`/
+    # `find_clashing_pairs`/`run_interference_check`.
+    world_min, world_max = _transform_all_corners(
+        bbox.Min, bbox.Max, bbox.Transform, _helper_deps
+    )
 
     try:
         return Outline(world_min, world_max)
@@ -1311,9 +1352,14 @@ class ClashResult(object):
 # "Reopened again - live-testing gap" section for the full story.
 # ---------------------------------------------------------------------------
 
-def _pad_bounding_box(box_min, box_max, fraction):
+def _pad_bounding_box(box_min, box_max, fraction, deps):
     """Expand the axis-aligned box [box_min, box_max] outward by `fraction`
     of each axis's own extent, on both sides.
+
+    T-12 (ticket 1012) fix: reachable from inside ``_RevitApiBridge.
+    Execute()`` (via ``reframe_active_view_on_clash``), where bare
+    module-level name lookups are broken - `deps` replaces the bare `XYZ`
+    reference below. See the module's "HELPER DEPS CONTAINER" section.
 
     Not part of the ticket's literal ask - a small, low-risk UX addition (in
     the same spirit as ticket 1003's StatusText/button-enabled additions) so
@@ -1342,10 +1388,10 @@ def _pad_bounding_box(box_min, box_max, fraction):
         padded_min.append(lo - pad)
         padded_max.append(hi + pad)
 
-    return XYZ(*padded_min), XYZ(*padded_max)
+    return deps.XYZ(*padded_min), deps.XYZ(*padded_max)
 
 
-def _combined_host_space_bounding_box(clash_result, host_doc, active_view):
+def _combined_host_space_bounding_box(clash_result, host_doc, active_view, deps):
     """Compute one combined (min_xyz, max_xyz) bounding box, in HOST
     coordinate space, covering BOTH elements of `clash_result` - the pair
     the camera should reframe on for US-4.
@@ -1392,6 +1438,14 @@ def _combined_host_space_bounding_box(clash_result, host_doc, active_view):
     uncaught) if the link itself can no longer be resolved/loaded - the
     caller (``reframe_active_view_on_clash``) catches that specifically so it
     can report the precise reason.
+
+    T-12 (ticket 1012) fix: this function only ever runs from inside
+    ``_RevitApiBridge.Execute()`` (via ``reframe_active_view_on_clash``),
+    where every bare module-level name lookup hits a broken, near-empty
+    scope - see the module's "HELPER DEPS CONTAINER" section further below.
+    `deps` (a `_HelperDeps` instance) replaces every bare reference below
+    (`resolve_link_instance_by_id`, `resolve_link_document`,
+    `_transform_all_corners`, `XYZ`), propagated to the two helper calls too.
     """
     try:
         host_bbox = clash_result.host_element.get_BoundingBox(active_view)
@@ -1400,13 +1454,13 @@ def _combined_host_space_bounding_box(clash_result, host_doc, active_view):
     if host_bbox is None:
         return None
 
-    link_instance = resolve_link_instance_by_id(
-        host_doc, clash_result.link_instance_id
+    link_instance = deps.resolve_link_instance_by_id(
+        host_doc, clash_result.link_instance_id, deps
     )
     # Raises ClashFlagError if the link is no longer loaded - checked here
     # (not just left to a get_BoundingBox() failure below) purely so the
     # caller gets a specific, actionable message rather than a silent None.
-    resolve_link_document(link_instance)
+    deps.resolve_link_document(link_instance, deps)
 
     try:
         link_bbox = clash_result.link_element.get_BoundingBox(None)
@@ -1419,17 +1473,17 @@ def _combined_host_space_bounding_box(clash_result, host_doc, active_view):
     # (GetTotalTransform over GetTransform, to fold in true-north) as
     # run_interference_check() makes for the detection pipeline itself.
     link_transform = link_instance.GetTotalTransform()
-    link_host_min, link_host_max = _transform_all_corners(
-        link_bbox.Min, link_bbox.Max, link_transform
+    link_host_min, link_host_max = deps._transform_all_corners(
+        link_bbox.Min, link_bbox.Max, link_transform, deps
     )
 
     host_min, host_max = host_bbox.Min, host_bbox.Max
-    combined_min = XYZ(
+    combined_min = deps.XYZ(
         min(host_min.X, link_host_min.X),
         min(host_min.Y, link_host_min.Y),
         min(host_min.Z, link_host_min.Z),
     )
-    combined_max = XYZ(
+    combined_max = deps.XYZ(
         max(host_max.X, link_host_max.X),
         max(host_max.Y, link_host_max.Y),
         max(host_max.Z, link_host_max.Z),
@@ -1437,7 +1491,7 @@ def _combined_host_space_bounding_box(clash_result, host_doc, active_view):
     return combined_min, combined_max
 
 
-def select_clash_pair(clash_result, host_doc, host_uidoc):
+def select_clash_pair(clash_result, host_doc, host_uidoc, deps):
     """Select/highlight BOTH elements of `clash_result` in the Revit UI - the
     host element directly, and the link element via a link-scoped
     ``Reference`` - so the user can actually tell WHICH two elements (out of
@@ -1516,13 +1570,22 @@ def select_clash_pair(clash_result, host_doc, host_uidoc):
     unloaded since the run that found this clash) - reported via
     ``output.print_md``, never raised, so a stale reference can't abort the
     reframe half of this action too.
+
+    T-12 (ticket 1012) fix: this function only ever runs from inside
+    ``_RevitApiBridge.Execute()`` (via ``reframe_active_view_on_clash`` and
+    ``ClashListWindow._apply_isolate_for_clash``), where every bare
+    module-level name lookup hits a broken, near-empty scope - see the
+    module's "HELPER DEPS CONTAINER" section further below. `deps` (a
+    `_HelperDeps` instance) replaces every bare reference below
+    (`resolve_link_instance_by_id`, `ClashFlagError`, `output`, `Reference`,
+    `List`).
     """
     try:
-        link_instance = resolve_link_instance_by_id(
-            host_doc, clash_result.link_instance_id
+        link_instance = deps.resolve_link_instance_by_id(
+            host_doc, clash_result.link_instance_id, deps
         )
-    except ClashFlagError as link_error:
-        output.print_md(
+    except deps.ClashFlagError as link_error:
+        deps.output.print_md(
             "_ClashFlag: could not select the clashing pair - {0}_".format(
                 link_error
             )
@@ -1530,12 +1593,12 @@ def select_clash_pair(clash_result, host_doc, host_uidoc):
         return False
 
     try:
-        host_reference = Reference(clash_result.host_element)
-        link_reference = Reference(clash_result.link_element).CreateLinkReference(
+        host_reference = deps.Reference(clash_result.host_element)
+        link_reference = deps.Reference(clash_result.link_element).CreateLinkReference(
             link_instance
         )
     except Exception as reference_error:
-        output.print_md(
+        deps.output.print_md(
             "_ClashFlag: could not build a selection reference for this "
             "clash (an element may have been deleted since the run that "
             "found it): {0}_".format(reference_error)
@@ -1544,10 +1607,10 @@ def select_clash_pair(clash_result, host_doc, host_uidoc):
 
     try:
         host_uidoc.Selection.SetReferences(
-            List[Reference]([host_reference, link_reference])
+            deps.List[deps.Reference]([host_reference, link_reference])
         )
     except Exception as selection_error:
-        output.print_md(
+        deps.output.print_md(
             "_ClashFlag: could not select the clashing pair: {0}_".format(
                 selection_error
             )
@@ -1557,7 +1620,7 @@ def select_clash_pair(clash_result, host_doc, host_uidoc):
     return True
 
 
-def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
+def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc, deps):
     """Reframe the ACTIVE view's camera onto the combined bounding box of
     `clash_result`'s two clashing elements, AND select/highlight both
     clashing elements (see ``select_clash_pair`` above) - together, the
@@ -1667,6 +1730,16 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
     delete, or modify any element, parameter, or persisted view property in
     either document, so no ``Transaction`` is opened here, consistent with
     the rest of this file's read-only design (see the module docstring).
+
+    T-12 (ticket 1012) fix: this function only ever runs from inside
+    ``_RevitApiBridge.Execute()`` (via ``__main__``'s camera-fly-to
+    closure), where every bare module-level name lookup hits a broken,
+    near-empty scope - see the module's "HELPER DEPS CONTAINER" section
+    further below. `deps` (a `_HelperDeps` instance) replaces every bare
+    reference below (`select_clash_pair`, `output`, `View3D`,
+    `ClashFlagError`, `_combined_host_space_bounding_box`,
+    `_pad_bounding_box`, `CAMERA_REFRAME_PADDING_FRACTION`), propagated to
+    every helper call this function makes.
     """
     # Select/highlight the clashing pair FIRST, unconditionally - this does
     # not require a 3D view (unlike the camera reframe below) and its
@@ -1675,11 +1748,11 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
     # independent steps" docstring paragraph above and select_clash_pair's
     # docstring for the full research trail on why this fixes a genuine,
     # live-testing-caught gap against the "equivalent to Show button" goal.
-    select_clash_pair(clash_result, host_doc, host_uidoc)
+    deps.select_clash_pair(clash_result, host_doc, host_uidoc, deps)
 
     active_view = host_doc.ActiveView
-    if not isinstance(active_view, View3D):
-        output.print_md(
+    if not isinstance(active_view, deps.View3D):
+        deps.output.print_md(
             "_ClashFlag: active view is not a 3D view - skipping camera "
             "reframe for this clash. Switch to a 3D view to use camera "
             "fly-to._"
@@ -1687,22 +1760,22 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
         return False
 
     try:
-        combined_box = _combined_host_space_bounding_box(
-            clash_result, host_doc, active_view
+        combined_box = deps._combined_host_space_bounding_box(
+            clash_result, host_doc, active_view, deps
         )
-    except ClashFlagError as combine_error:
-        output.print_md("_ClashFlag: {0}_".format(combine_error))
+    except deps.ClashFlagError as combine_error:
+        deps.output.print_md("_ClashFlag: {0}_".format(combine_error))
         return False
 
     if combined_box is None:
-        output.print_md(
+        deps.output.print_md(
             "_ClashFlag: could not read a bounding box for one or both "
             "elements in this clash - skipping camera reframe._"
         )
         return False
 
-    padded_min, padded_max = _pad_bounding_box(
-        combined_box[0], combined_box[1], CAMERA_REFRAME_PADDING_FRACTION
+    padded_min, padded_max = deps._pad_bounding_box(
+        combined_box[0], combined_box[1], deps.CAMERA_REFRAME_PADDING_FRACTION, deps
     )
 
     target_uiview = None
@@ -1712,7 +1785,7 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
             break
 
     if target_uiview is None:
-        output.print_md(
+        deps.output.print_md(
             "_ClashFlag: the active 3D view isn't open in any on-screen "
             "window (no matching UIView) - skipping camera reframe._"
         )
@@ -1721,7 +1794,7 @@ def reframe_active_view_on_clash(clash_result, host_doc, host_uidoc):
     try:
         target_uiview.ZoomAndCenterRectangle(padded_min, padded_max)
     except Exception as zoom_error:
-        output.print_md("_ClashFlag: camera reframe failed: {0}_".format(zoom_error))
+        deps.output.print_md("_ClashFlag: camera reframe failed: {0}_".format(zoom_error))
         return False
 
     return True
@@ -1783,11 +1856,29 @@ class _RevitApiBridge(IExternalEventHandler):
     context, and module load time (this script actively executing as a
     pyRevit command) is exactly that; constructing it lazily from inside a
     later, invalid-context event handler would defeat the whole point.
+
+    T-12 (ticket 1012) fix: ``Execute`` IS the literal method Revit's own
+    .NET interop layer invokes directly (implementing ``IExternalEvent
+    Handler.Execute``) - the exact kind of .NET-to-Python boundary crossing
+    tickets 1011/1012 identify as the root cause of the broken, near-empty
+    scope every bare module-level name lookup hits from there on. This
+    wasn't in either ticket's own enumeration (1011 only looked at
+    ``ClashListWindow``; 1012's graph starts FROM functions reachable from
+    inside ``Execute()``, not ``Execute`` itself) - found by grepping this
+    file for every remaining bare reference, per 1012's own "do not trust
+    the list blindly" instruction. In today's code every queued closure
+    (``_apply``/``_clear``/``_reframe``) already catches and reports its own
+    exceptions internally without re-raising, so this except-block is a
+    backstop that isn't known to fire in practice yet - fixed anyway,
+    defensively, with the same `self.*`-capture-in-__init__ pattern ticket
+    1011 already established (``__init__`` is not itself delegate-invoked,
+    so it has this module's real globals).
     """
 
     def __init__(self):
         self._pending_actions = []
         self.external_event = ExternalEvent.Create(self)
+        self._output = output
 
     def raise_action(self, action):
         self._pending_actions.append(action)
@@ -1799,7 +1890,7 @@ class _RevitApiBridge(IExternalEventHandler):
             try:
                 action()
             except Exception as bridge_error:
-                output.print_md(
+                self._output.print_md(
                     "_ClashFlag: a queued action failed inside the API-"
                     "context bridge: {0}_".format(bridge_error)
                 )
@@ -1840,7 +1931,7 @@ def _category_name_for_colorize(element):
     return "<no category>"
 
 
-def _category_pair_key(clash_result):
+def _category_pair_key(clash_result, deps):
     """Stable, ORDER-INDEPENDENT dict key for one clash's category pair.
 
     Returns the host-side and link-side category names as a sorted 2-tuple,
@@ -1852,14 +1943,32 @@ def _category_pair_key(clash_result):
     two names in natural (host, link) order, as an earlier version of this
     function did, was exactly this bug: the same pairing got two different
     dict keys - and two different colors - depending on host/link direction.
+
+    T-12 (ticket 1012) fix, BEYOND the ticket's own literal text: the ticket
+    itself documents this function's one bare reference
+    (`_category_name_for_colorize`) but states "safe as-is, no change
+    needed" for it. Live-testing verification of that specific claim was not
+    possible in this session, and this function is called (via
+    `deps._category_pair_key`) from `apply_colorize_overrides`/
+    `_build_category_pair_color_map`, which DO run inside
+    `_RevitApiBridge.Execute()`'s broken-scope call chain - per this
+    ticket's own "revised understanding" (every bare name lookup in EVERY
+    function called from there is broken, not just the directly
+    delegate-invoked one), this function's own bare
+    `_category_name_for_colorize` reference would be exactly as much at risk
+    as every other one already fixed here. Threading `deps` through this
+    function too costs nothing and closes that residual risk defensively -
+    flagged explicitly for the reviewer/next live retest to double-check,
+    since it deviates from the ticket's literal instruction (which called
+    this function safe as-is).
     """
     return tuple(sorted([
-        _category_name_for_colorize(clash_result.host_element),
-        _category_name_for_colorize(clash_result.link_element),
+        deps._category_name_for_colorize(clash_result.host_element),
+        deps._category_name_for_colorize(clash_result.link_element),
     ]))
 
 
-def _stable_hash_int(text):
+def _stable_hash_int(text, deps):
     """Deterministic hash of `text` into a non-negative int, stable across
     processes, runs, and machines - unlike Python's built-in `hash()`, which
     (for str, since Python 3.3's hash randomization / PYTHONHASHSEED) is
@@ -1870,12 +1979,16 @@ def _stable_hash_int(text):
     the UTF-8 encoded text is a pure function of its input bytes only, with
     no such salt, and is more than adequate here since this is a visual
     bucketing aid, not a security or uniqueness guarantee.
+
+    T-12 (ticket 1012) fix: reachable from inside ``_RevitApiBridge.
+    Execute()`` (via ``_color_for_category_pair``), where bare module-level
+    name lookups are broken - `deps` replaces the bare `hashlib` reference.
     """
-    digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+    digest = deps.hashlib.md5(text.encode("utf-8")).hexdigest()
     return int(digest[:8], 16)
 
 
-def _color_for_category_pair(pair_key):
+def _color_for_category_pair(pair_key, deps):
     """Deterministic Color for an order-independent category pair key (see
     `_category_pair_key`), derived by hashing the pair directly into a hue
     rather than looking one up in a small fixed, hand-picked palette.
@@ -1898,21 +2011,28 @@ def _color_for_category_pair(pair_key):
     count, and needs no stored/persisted table: it is a pure function of the
     pair's own name, recomputed fresh every call, per US-5's
     zero-configuration requirement.
+
+    T-12 (ticket 1012) fix: reachable from inside ``_RevitApiBridge.
+    Execute()`` (via ``_build_category_pair_color_map`` /
+    ``apply_colorize_overrides``), where bare module-level name lookups are
+    broken - `deps` replaces the bare `_stable_hash_int`, `colorsys`,
+    `_CATEGORY_PAIR_LIGHTNESS`, `_CATEGORY_PAIR_SATURATION`, and `Color`
+    references below.
     """
     pair_text = "|".join(pair_key)
-    hue_degrees = _stable_hash_int(pair_text) % 360
+    hue_degrees = deps._stable_hash_int(pair_text, deps) % 360
     hue_fraction = hue_degrees / 360.0
-    red, green, blue = colorsys.hls_to_rgb(
-        hue_fraction, _CATEGORY_PAIR_LIGHTNESS, _CATEGORY_PAIR_SATURATION
+    red, green, blue = deps.colorsys.hls_to_rgb(
+        hue_fraction, deps._CATEGORY_PAIR_LIGHTNESS, deps._CATEGORY_PAIR_SATURATION
     )
 
     def _to_byte(channel):
         return int(round(max(0.0, min(1.0, channel)) * 255))
 
-    return Color(_to_byte(red), _to_byte(green), _to_byte(blue))
+    return deps.Color(_to_byte(red), _to_byte(green), _to_byte(blue))
 
 
-def _build_category_pair_color_map(clash_results):
+def _build_category_pair_color_map(clash_results, deps):
     """Deterministic, order-independent category-pair -> Color map.
 
     Each distinct pair's Color (`_color_for_category_pair`) is a PURE
@@ -1927,20 +2047,30 @@ def _build_category_pair_color_map(clash_results):
     into the full hue space has no such ceiling and needs no stored table -
     the same pair name always hashes to the same color, in any model, on any
     run, with zero configuration.
+
+    T-12 (ticket 1012) fix: reachable from inside ``_RevitApiBridge.
+    Execute()`` (via ``apply_colorize_overrides``), where bare module-level
+    name lookups are broken - `deps` replaces the bare `_category_pair_key`
+    and `_color_for_category_pair` references, propagated to both calls.
     """
-    distinct_pairs = set(_category_pair_key(cr) for cr in clash_results)
-    return {pair: _color_for_category_pair(pair) for pair in distinct_pairs}
+    distinct_pairs = set(deps._category_pair_key(cr, deps) for cr in clash_results)
+    return {pair: deps._color_for_category_pair(pair, deps) for pair in distinct_pairs}
 
 
-def _find_solid_fill_pattern_id(host_doc):
+def _find_solid_fill_pattern_id(host_doc, deps):
     """Return the ElementId of a solid DRAFTING fill pattern in `host_doc`,
     or None if one can't be found. Every out-of-the-box Revit template ships
     one ("<Solid fill>"), but a deliberately stripped-down project template
     might not - callers must tolerate None (skip the surface-pattern half of
     the override, keep the line-color half) rather than assume this always
     succeeds.
+
+    T-12 (ticket 1012) fix: reachable from inside ``_RevitApiBridge.
+    Execute()`` (via ``apply_colorize_overrides``), where bare module-level
+    name lookups are broken - `deps` replaces the bare
+    `FilteredElementCollector`/`FillPatternElement` references below.
     """
-    for fill_pattern_element in FilteredElementCollector(host_doc).OfClass(FillPatternElement):
+    for fill_pattern_element in deps.FilteredElementCollector(host_doc).OfClass(deps.FillPatternElement):
         try:
             fill_pattern = fill_pattern_element.GetFillPattern()
         except Exception:
@@ -1950,7 +2080,7 @@ def _find_solid_fill_pattern_id(host_doc):
     return None
 
 
-def _colorize_settings_for(color, solid_fill_pattern_id):
+def _colorize_settings_for(color, solid_fill_pattern_id, deps):
     """Build one OverrideGraphicSettings that renders as `color` regardless
     of the active view's visual style.
 
@@ -1962,8 +2092,13 @@ def _colorize_settings_for(color, solid_fill_pattern_id):
     Camera fly-to (1004) reframes on a 3D view, which is commonly Shaded or
     Realistic, so relying on line color alone would make this toggle look
     like it did nothing for most users.
+
+    T-12 (ticket 1012) fix: reachable from inside ``_RevitApiBridge.
+    Execute()`` (via ``apply_colorize_overrides``), where bare module-level
+    name lookups are broken - `deps` replaces the bare
+    `OverrideGraphicSettings` reference below.
     """
-    settings = OverrideGraphicSettings()
+    settings = deps.OverrideGraphicSettings()
     settings.SetProjectionLineColor(color)
     settings.SetCutLineColor(color)
     if solid_fill_pattern_id is not None:
@@ -1974,7 +2109,7 @@ def _colorize_settings_for(color, solid_fill_pattern_id):
     return settings
 
 
-def apply_colorize_overrides(clash_results, host_doc, active_view):
+def apply_colorize_overrides(clash_results, host_doc, active_view, deps):
     """Apply a per-category-pair (order-independent - see `_category_pair_key`)
     color override to every HOST-SIDE element across `clash_results`, in
     `active_view`. See this module's "COLORIZE BY CATEGORY" section header
@@ -2006,13 +2141,22 @@ def apply_colorize_overrides(clash_results, host_doc, active_view):
     one transaction per element - with the whole loop wrapped in a
     try/except that rolls back on any failure rather than leaving a half-
     applied transaction open, per project ground rules.
+
+    T-12 (ticket 1012) fix: this function only ever runs from inside
+    ``_RevitApiBridge.Execute()`` (via ``ClashListWindow.
+    colorize_checkbox_checked``'s queued ``_apply`` closure), where bare
+    module-level name lookups are broken - `deps` (a `_HelperDeps` instance)
+    replaces every bare reference below (`_build_category_pair_color_map`,
+    `_find_solid_fill_pattern_id`, `Transaction`, `_category_pair_key`,
+    `_colorize_settings_for`), propagated to every helper call this function
+    makes.
     """
-    color_map = _build_category_pair_color_map(clash_results)
-    solid_fill_pattern_id = _find_solid_fill_pattern_id(host_doc)
+    color_map = deps._build_category_pair_color_map(clash_results, deps)
+    solid_fill_pattern_id = deps._find_solid_fill_pattern_id(host_doc, deps)
 
     previous_overrides = {}
 
-    transaction = Transaction(host_doc, "ClashFlag: colorize by category")
+    transaction = deps.Transaction(host_doc, "ClashFlag: colorize by category")
     transaction.Start()
     try:
         for clash_result in clash_results:
@@ -2022,10 +2166,10 @@ def apply_colorize_overrides(clash_results, host_doc, active_view):
             if id_key not in previous_overrides:
                 previous_overrides[id_key] = active_view.GetElementOverrides(host_element.Id)
 
-            pair_color = color_map[_category_pair_key(clash_result)]
+            pair_color = color_map[deps._category_pair_key(clash_result, deps)]
             active_view.SetElementOverrides(
                 host_element.Id,
-                _colorize_settings_for(pair_color, solid_fill_pattern_id),
+                deps._colorize_settings_for(pair_color, solid_fill_pattern_id, deps),
             )
     except Exception:
         transaction.RollBack()
@@ -2036,7 +2180,7 @@ def apply_colorize_overrides(clash_results, host_doc, active_view):
     return previous_overrides
 
 
-def clear_colorize_overrides(host_doc, view, previous_overrides):
+def clear_colorize_overrides(host_doc, view, previous_overrides, deps):
     """Restore every host element touched by `apply_colorize_overrides` back
     to whatever `OverrideGraphicSettings` it had immediately before colorize
     was turned on (`previous_overrides`, keyed by `ElementId.IntegerValue` -
@@ -2065,12 +2209,18 @@ def clear_colorize_overrides(host_doc, view, previous_overrides):
 
     Opens exactly one Transaction ("ClashFlag: clear colorize overrides")
     for the whole batch, same reasoning as `apply_colorize_overrides`.
+
+    T-12 (ticket 1012) fix: this function only ever runs from inside
+    ``_RevitApiBridge.Execute()`` (via ``ClashListWindow.
+    _clear_colorize_if_active``'s queued ``_clear`` closure), where bare
+    module-level name lookups are broken - `deps` replaces the bare
+    `Transaction`/`ElementId` references below.
     """
-    transaction = Transaction(host_doc, "ClashFlag: clear colorize overrides")
+    transaction = deps.Transaction(host_doc, "ClashFlag: clear colorize overrides")
     transaction.Start()
     try:
         for id_int_value, previous_settings in previous_overrides.items():
-            element_id = ElementId(id_int_value)
+            element_id = deps.ElementId(id_int_value)
             try:
                 view.SetElementOverrides(element_id, previous_settings)
             except Exception:
@@ -2148,7 +2298,7 @@ def clear_colorize_overrides(host_doc, view, previous_overrides):
 # ---------------------------------------------------------------------------
 
 
-def _isolate_host_element(host_doc, view, host_element_id):
+def _isolate_host_element(host_doc, view, host_element_id, deps):
     """Put `view` into Temporary Isolate mode showing ONLY `host_element_id`
     - the "hides everything ... except the current clash's host-side
     element" half of US-7. Only ever called with a HOST-document element id
@@ -2163,9 +2313,15 @@ def _isolate_host_element(host_doc, view, host_element_id):
     isolated set rather than accumulating it, so navigating to a new clash
     while Isolate is on can just call this again for the new clash's host
     element with no separate "clear first" step.
+
+    T-12 (ticket 1012) fix: this function only ever runs from inside
+    ``_RevitApiBridge.Execute()`` (via ``ClashListWindow.
+    _apply_isolate_for_clash``'s queued ``_apply`` closure), where bare
+    module-level name lookups are broken - `deps` replaces the bare
+    `List`/`ElementId`/`Transaction` references below.
     """
-    id_list = List[ElementId]([host_element_id])
-    transaction = Transaction(host_doc, "ClashFlag: isolate current clash")
+    id_list = deps.List[deps.ElementId]([host_element_id])
+    transaction = deps.Transaction(host_doc, "ClashFlag: isolate current clash")
     transaction.Start()
     try:
         view.IsolateElementsTemporary(id_list)
@@ -2176,7 +2332,7 @@ def _isolate_host_element(host_doc, view, host_element_id):
         transaction.Commit()
 
 
-def _exit_temporary_isolate(host_doc, view):
+def _exit_temporary_isolate(host_doc, view, deps):
     """Exit Temporary Isolate mode on `view`, restoring full visibility -
     the "turning Isolate off ... immediately restores the full view" half
     of US-7. Guards with ``IsInTemporaryViewMode`` first (see this section's
@@ -2187,18 +2343,132 @@ def _exit_temporary_isolate(host_doc, view):
     clear, though ``ClashListWindow._clear_isolate_if_active``'s own
     ``isolate_active`` guard already prevents that particular case from
     reaching here at all).
+
+    T-12 (ticket 1012) fix: this function only ever runs from inside
+    ``_RevitApiBridge.Execute()`` (via ``ClashListWindow.
+    _clear_isolate_if_active``'s queued ``_clear`` closure), where bare
+    module-level name lookups are broken - `deps` replaces the bare
+    `Transaction`/`TemporaryViewMode` references below.
     """
-    if not view.IsInTemporaryViewMode(TemporaryViewMode.TemporaryHideIsolate):
+    if not view.IsInTemporaryViewMode(deps.TemporaryViewMode.TemporaryHideIsolate):
         return
-    transaction = Transaction(host_doc, "ClashFlag: exit isolate mode")
+    transaction = deps.Transaction(host_doc, "ClashFlag: exit isolate mode")
     transaction.Start()
     try:
-        view.DisableTemporaryViewMode(TemporaryViewMode.TemporaryHideIsolate)
+        view.DisableTemporaryViewMode(deps.TemporaryViewMode.TemporaryHideIsolate)
     except Exception:
         transaction.RollBack()
         raise
     else:
         transaction.Commit()
+
+
+# ---------------------------------------------------------------------------
+# HELPER DEPS CONTAINER (T-12 / ticket 1012)
+#
+# See tickets/1012-fix-deep-helper-globals-crash.md's "Revised understanding
+# of the root cause" section for the full write-up. Ticket 1011 fixed
+# ClashListWindow's delegate-wired methods themselves (colorize_checkbox_
+# checked, _clear_colorize_if_active, _apply_isolate_for_clash, _clear_
+# isolate_if_active) by routing their OWN bare module-level references
+# through self.* attributes - but live retesting after 1011 deployed showed
+# the same broken/near-empty-scope bug goes one layer deeper: EVERY function
+# transitively called from inside `_RevitApiBridge.Execute()` (the
+# IExternalEventHandler.Execute callback Revit invokes to run a queued
+# colorize/isolate/camera-fly-to action) hits the identical broken scope for
+# its OWN bare name lookups too - not just the one function IronPython
+# directly invoked across the .NET-to-Python boundary. `_HelperDeps` is one
+# plain container, built here at MODULE LOAD time (a normal, top-to-bottom
+# script execution - NOT inside any class or delegate, so every bare name on
+# the right-hand side below resolves correctly, exactly like `__init__`/
+# `show_clash_list` do for the same reason in 1011's fix), holding every
+# module-level name any function in that call graph needs. Every such
+# function takes `deps` as an additional (last positional) parameter and
+# reads `deps.Xxx` instead of a bare `Xxx` for each name it needs - see the
+# ticket for the full, function-by-function enumeration this was built and
+# cross-checked against (by grepping and re-reading every function body in
+# this file, not by trusting the ticket's own list blindly - a few
+# additional bare references the ticket's own enumeration missed,
+# specifically two more `XYZ` uses inside `_combined_host_space_bounding_
+# box` and `_category_pair_key`'s own internal `_category_name_for_colorize`
+# reference, were found and fixed the same way; see those functions' own
+# T-12 docstring notes).
+#
+# Built here - after the "COLORIZE BY CATEGORY" and "ISOLATE CURRENT CLASH"
+# sections, rather than immediately after `_revit_api_bridge` above -
+# because several of the names it needs (`_color_for_category_pair`,
+# `_build_category_pair_color_map`, `_find_solid_fill_pattern_id`,
+# `_colorize_settings_for`, `_category_pair_key`,
+# `_category_name_for_colorize`) are defined in that later section: this
+# container must be built AFTER every name it references already exists,
+# and it only needs to exist before `ClashListWindow.__init__` first runs
+# (at Show-clash-list time, well after module load finishes) or before
+# `__main__`'s camera-fly-to closure is defined - both comfortably later
+# than every def/class/import this depends on.
+# ---------------------------------------------------------------------------
+
+
+class _HelperDeps(object):
+    """Plain attribute-bag container - see the section header comment above.
+    No behavior of its own; it exists purely so broken-scope functions have
+    something other than a bare module-level name to read these values from.
+    """
+    pass
+
+
+_helper_deps = _HelperDeps()
+
+# Revit API / .NET types and modules referenced bare inside the affected
+# call graph.
+_helper_deps.Transaction = Transaction
+_helper_deps.ElementId = ElementId
+_helper_deps.List = List
+_helper_deps.Reference = Reference
+_helper_deps.TemporaryViewMode = TemporaryViewMode
+_helper_deps.FilteredElementCollector = FilteredElementCollector
+_helper_deps.FillPatternElement = FillPatternElement
+_helper_deps.OverrideGraphicSettings = OverrideGraphicSettings
+_helper_deps.Color = Color
+_helper_deps.View3D = View3D
+_helper_deps.RevitLinkInstance = RevitLinkInstance
+_helper_deps.XYZ = XYZ
+_helper_deps.colorsys = colorsys
+_helper_deps.hashlib = hashlib
+
+# pyRevit singletons and module-level constants referenced bare inside the
+# affected call graph.
+_helper_deps.output = output
+_helper_deps.ClashFlagError = ClashFlagError
+_helper_deps.CAMERA_REFRAME_PADDING_FRACTION = CAMERA_REFRAME_PADDING_FRACTION
+_helper_deps._CATEGORY_PAIR_SATURATION = _CATEGORY_PAIR_SATURATION
+_helper_deps._CATEGORY_PAIR_LIGHTNESS = _CATEGORY_PAIR_LIGHTNESS
+
+# ClashFlag helper functions this same call graph calls into each other -
+# each of these is itself ALSO updated to take `deps` as its own last
+# parameter (except `_category_name_for_colorize`, which has no bare
+# module-level references of its own and needs no change at all - see its
+# own docstring and ticket 1012 instruction #6).
+_helper_deps.resolve_link_instance_by_id = resolve_link_instance_by_id
+_helper_deps.resolve_link_document = resolve_link_document
+_helper_deps._transform_all_corners = _transform_all_corners
+_helper_deps._pad_bounding_box = _pad_bounding_box
+_helper_deps._combined_host_space_bounding_box = _combined_host_space_bounding_box
+_helper_deps.select_clash_pair = select_clash_pair
+_helper_deps._category_name_for_colorize = _category_name_for_colorize
+_helper_deps._category_pair_key = _category_pair_key
+_helper_deps._stable_hash_int = _stable_hash_int
+_helper_deps._color_for_category_pair = _color_for_category_pair
+_helper_deps._build_category_pair_color_map = _build_category_pair_color_map
+_helper_deps._find_solid_fill_pattern_id = _find_solid_fill_pattern_id
+_helper_deps._colorize_settings_for = _colorize_settings_for
+# NOTE: `apply_colorize_overrides`, `clear_colorize_overrides`,
+# `_isolate_host_element`, `_exit_temporary_isolate`, and
+# `reframe_active_view_on_clash` are entry points into this graph, each
+# already reached via its own `self._xxx_fn` attribute (captured in
+# `ClashListWindow.__init__`, per ticket 1011's pattern) or via a captured
+# local in `__main__`'s camera-fly-to closure (see below) - none of them is
+# ever referenced BARE from inside another graph function's body, so none
+# needs an entry here.
 
 
 # Kept alive here purely to prevent .NET/CLR garbage collection of an open
@@ -2260,8 +2530,19 @@ def _wpf_color_for_category_pair(clash_result):
     the exact T-8 functions, not a re-derived/approximated hash - so the
     legend can never drift out of sync with what Colorize (T-5) actually
     applies to the model.
+
+    T-12 (ticket 1012): `_category_pair_key`/`_color_for_category_pair` now
+    both take a `deps` parameter (see the "HELPER DEPS CONTAINER" section
+    above) - this call site itself is always safe (only ever reached from
+    `ClashListWindow.__init__`'s item-population loop, a plain constructor
+    call that never crosses a delegate/bridge boundary, per ticket 1011's
+    same reasoning for `__init__` itself), so it reads the always-correct
+    module-level `_helper_deps` bare directly rather than needing its own
+    `deps` parameter threaded all the way through `_build_clash_list_row`.
     """
-    revit_color = _color_for_category_pair(_category_pair_key(clash_result))
+    revit_color = _color_for_category_pair(
+        _category_pair_key(clash_result, _helper_deps), _helper_deps
+    )
     return MediaColor.FromRgb(revit_color.Red, revit_color.Green, revit_color.Blue)
 
 
@@ -2432,6 +2713,20 @@ class ClashListWindow(forms.WPFWindow):
         self._isolate_host_element_fn = _isolate_host_element
         self._exit_temporary_isolate_fn = _exit_temporary_isolate
         self._select_clash_pair_fn = select_clash_pair
+        # T-12 (ticket 1012) fix: `apply_colorize_overrides`/
+        # `clear_colorize_overrides`/`_isolate_host_element`/
+        # `_exit_temporary_isolate`/`select_clash_pair` themselves (the
+        # functions captured just above, as `self._xxx_fn`) now ALSO need a
+        # `deps` argument for THEIR OWN bare module-level references, since
+        # the broken-scope bug (see tickets/1012-fix-deep-helper-globals-
+        # crash.md) reaches every function called from inside
+        # `_RevitApiBridge.Execute()`, not just the outer delegate-wired
+        # method - `self._helper_deps` is captured here, in `__init__`
+        # (unaffected, same reason every other `self._xxx` capture above
+        # is), and threaded through as a local (`deps = self._helper_deps`)
+        # in every delegate-wired method below that calls one of these
+        # functions.
+        self._helper_deps = _helper_deps
 
         for clash_result in self.clash_results:
             # T-10 (US-8): each row is now a small Legend swatch (see
@@ -2475,18 +2770,26 @@ class ClashListWindow(forms.WPFWindow):
         here, at the top of the OUTER method, so the nested closure below
         picks it up via its normal enclosing-scope cell mechanism) instead of
         referenced bare.
+
+        T-12 (ticket 1012) fix: the SAME broken scope also reaches
+        `apply_overrides_fn`'s (i.e. `apply_colorize_overrides`'s) OWN body
+        once it's called from inside `_apply` (which itself runs inside
+        `_RevitApiBridge.Execute()`) - `deps` (`self._helper_deps`,
+        captured the same safe way as every other `self.*` attribute here)
+        is threaded through as its new last argument.
         """
         host_doc = self._doc
         apply_overrides_fn = self._apply_colorize_overrides_fn
         show_forms = self._forms
         print_output = self._output
         bridge = self._bridge
+        deps = self._helper_deps
 
         def _apply():
             active_view = host_doc.ActiveView
             try:
                 previous_overrides = apply_overrides_fn(
-                    self.clash_results, host_doc, active_view
+                    self.clash_results, host_doc, active_view, deps
                 )
             except Exception as colorize_error:
                 show_forms.alert(
@@ -2551,6 +2854,11 @@ class ClashListWindow(forms.WPFWindow):
         list`'s Closed handler) with broken `func_globals` - every
         module-level name needed is read from a `self.*` attribute, captured
         into a local at the top of this method, instead of referenced bare.
+
+        T-12 (ticket 1012) fix: `clear_overrides_fn` (i.e.
+        `clear_colorize_overrides`) itself now also needs `deps` (see that
+        function's own T-12 docstring note) - threaded through the same way
+        as every other `self.*` capture here.
         """
         if not self.colorize_active:
             return
@@ -2559,6 +2867,7 @@ class ClashListWindow(forms.WPFWindow):
         print_output = self._output
         clear_overrides_fn = self._clear_colorize_overrides_fn
         bridge = self._bridge
+        deps = self._helper_deps
 
         view_id = self.colorize_view_id
         previous_overrides = self.colorize_previous_overrides
@@ -2570,7 +2879,7 @@ class ClashListWindow(forms.WPFWindow):
             view = host_doc.GetElement(view_id) if view_id else None
             if view is not None:
                 try:
-                    clear_overrides_fn(host_doc, view, previous_overrides)
+                    clear_overrides_fn(host_doc, view, previous_overrides, deps)
                 except Exception as clear_error:
                     print_output.print_md(
                         "_ClashFlag: failed to fully clear colorize "
@@ -2666,6 +2975,13 @@ class ClashListWindow(forms.WPFWindow):
         therefore read from a `self.*` attribute, captured into a local at
         the top of this method (alongside the existing `reuse_view_id`
         capture below) instead of referenced bare.
+
+        T-12 (ticket 1012) fix: `isolate_host_element_fn`
+        (`_isolate_host_element`) and `select_clash_pair_fn`
+        (`select_clash_pair`) themselves now ALSO need `deps` for their own
+        bare module-level references (see each function's own T-12
+        docstring note) - threaded through the same way as every other
+        `self.*` capture here.
         """
         if clash_result is None:
             return
@@ -2676,6 +2992,7 @@ class ClashListWindow(forms.WPFWindow):
         isolate_host_element_fn = self._isolate_host_element_fn
         select_clash_pair_fn = self._select_clash_pair_fn
         bridge = self._bridge
+        deps = self._helper_deps
 
         # None only on the very first apply of a session (see docstring
         # above) - captured here, in the raw handler body, not inside the
@@ -2703,7 +3020,7 @@ class ClashListWindow(forms.WPFWindow):
                 view = host_doc.ActiveView
 
             try:
-                isolate_host_element_fn(host_doc, view, clash_result.host_element.Id)
+                isolate_host_element_fn(host_doc, view, clash_result.host_element.Id, deps)
             except Exception as isolate_error:
                 print_output.print_md(
                     "_ClashFlag: could not isolate this clash's host "
@@ -2724,7 +3041,7 @@ class ClashListWindow(forms.WPFWindow):
             # element can't be isolated (same API ceiling as colorize's
             # host-only override limitation), so Select keeps it findable
             # inside the still-fully-visible link model.
-            select_clash_pair_fn(clash_result, host_doc, host_uidoc)
+            select_clash_pair_fn(clash_result, host_doc, host_uidoc, deps)
 
             if is_first_apply_in_session:
                 # Printed once per session (first check), not on every
@@ -2772,6 +3089,11 @@ class ClashListWindow(forms.WPFWindow):
         list`'s Closed handler) with broken `func_globals` - every
         module-level name needed is read from a `self.*` attribute, captured
         into a local at the top of this method, instead of referenced bare.
+
+        T-12 (ticket 1012) fix: `exit_temporary_isolate_fn`
+        (`_exit_temporary_isolate`) itself now also needs `deps` (see that
+        function's own T-12 docstring note) - threaded through the same way
+        as every other `self.*` capture here.
         """
         if not self.isolate_active:
             return
@@ -2780,6 +3102,7 @@ class ClashListWindow(forms.WPFWindow):
         print_output = self._output
         exit_temporary_isolate_fn = self._exit_temporary_isolate_fn
         bridge = self._bridge
+        deps = self._helper_deps
 
         view_id = self.isolate_view_id
         self.isolate_active = False
@@ -2796,7 +3119,7 @@ class ClashListWindow(forms.WPFWindow):
                 )
                 return
             try:
-                exit_temporary_isolate_fn(host_doc, view)
+                exit_temporary_isolate_fn(host_doc, view, deps)
             except Exception as clear_error:
                 print_output.print_md(
                     "_ClashFlag: failed to fully exit Temporary Isolate "
@@ -2997,8 +3320,14 @@ def run_interference_check(scope_selection):
     # of, the per-link console reporting below.
 
     for link_element_id, link_categories in scope_selection.link_selections:
-        link_instance = resolve_link_instance_by_id(doc, link_element_id)
-        link_doc = resolve_link_document(link_instance)
+        # T-12 (ticket 1012): `resolve_link_instance_by_id`/
+        # `resolve_link_document` now both take a `deps` parameter (see the
+        # "HELPER DEPS CONTAINER" section above) - this call site is always
+        # safe (`run_interference_check` only ever runs directly and
+        # synchronously from `__main__`, never through the bridge), so it
+        # reads the always-correct module-level `_helper_deps` bare directly.
+        link_instance = resolve_link_instance_by_id(doc, link_element_id, _helper_deps)
+        link_doc = resolve_link_document(link_instance, _helper_deps)
         link_name = _link_display_name(link_instance)
 
         output.print_md("### Linked model: **{0}**".format(link_name))
@@ -3110,12 +3439,39 @@ if __name__ == "__main__":
                 # (reading ActiveView, resolving the link, calling
                 # ZoomAndCenterRectangle) happens later, back in a valid
                 # context, inside `_RevitApiBridge.Execute()`.
+                #
+                # T-12 (ticket 1012) fix: `reframe_active_view_on_clash`
+                # itself now needs `deps` for its own (and its callees')
+                # bare module-level references - same broken-scope bug as
+                # colorize/isolate, reaching this closure via the identical
+                # `_revit_api_bridge.raise_action(...)` -> `Execute()` path.
+                # `doc`/`uidoc`/`reframe_active_view_on_clash`/`_helper_deps`
+                # are captured into LOCALS here, in `__main__`'s own body
+                # (a plain, synchronous, always-safe execution context, the
+                # same reasoning ticket 1011 relies on for `__init__`) -
+                # `_reframe` then reads them back via ordinary closure-cell
+                # capture (like `_apply`'s `host_doc`/`bridge`/etc. locals
+                # above) rather than as bare module-level globals, since this
+                # specific closure was flagged in ticket 1012 itself as
+                # "not yet reported broken... verify rather than assume it's
+                # still fine" - capturing defensively here removes that
+                # residual risk entirely rather than leaving it unverified.
+                camera_reframe_doc = doc
+                camera_reframe_uidoc = uidoc
+                camera_reframe_deps = _helper_deps
+                camera_reframe_fn = reframe_active_view_on_clash
+
                 def _on_clash_selection_changed(clash_result, index):
                     if clash_result is None:
                         return
 
                     def _reframe():
-                        reframe_active_view_on_clash(clash_result, doc, uidoc)
+                        camera_reframe_fn(
+                            clash_result,
+                            camera_reframe_doc,
+                            camera_reframe_uidoc,
+                            camera_reframe_deps,
+                        )
 
                     _revit_api_bridge.raise_action(_reframe)
 
