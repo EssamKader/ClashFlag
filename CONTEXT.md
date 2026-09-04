@@ -54,3 +54,16 @@ A read-out of the current Category-Pair-to-color mapping, shown inline in
 the clash list panel itself (e.g. a color swatch next to each clash entry)
 so a color's meaning is always visible alongside the clash it belongs to,
 never a lookup you have to go find elsewhere.
+
+**Clash-Eligible Category**:
+A Model-type Category offered in ClashFlag's category picker for a given
+document (host or a selected link). A category qualifies only if at least
+one of its instances carries real solid geometry (a non-null `Solid` with
+`Volume > 0`) — not merely "at least one instance exists." This is what
+correctly excludes categories like Project Information and Lines, which can
+have instances but nothing that actually occupies space to clash against.
+Doors/Windows being absent from a given model's picker is not a bug under
+this definition — it means that document genuinely has zero instances of
+that category, geometric or otherwise.
+_Avoid_: "present category" — the prior implementation's instance-count-only
+check, which is the bug this term corrects.

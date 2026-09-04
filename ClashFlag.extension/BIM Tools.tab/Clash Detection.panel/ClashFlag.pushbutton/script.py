@@ -977,9 +977,10 @@ def find_clashing_pairs(host_candidates, link_candidates):
 # ---------------------------------------------------------------------------
 
 def _enumerate_present_categories(target_doc):
-    """Yield (BuiltInCategory, display_name) pairs for every Model-type
-    category that actually has at least one placed (non-type) element in
-    `target_doc`.
+    """Yield (BuiltInCategory, display_name) pairs for every
+    Clash-Eligible Category (see CONTEXT.md) in `target_doc` - a
+    ``CategoryType.Model`` category with at least one instance that carries
+    real solid geometry, not merely "an instance exists."
 
     Restricted to ``CategoryType.Model`` categories (walls, structural
     framing, ducts, pipes, etc.) - deliberately excludes annotation/
@@ -998,14 +999,61 @@ def _enumerate_present_categories(target_doc):
     support would need ElementId-based filtering throughout and is tracked
     as a possible future ticket, not solved here.
 
-    Existence is checked with
-    ``FilteredElementCollector(...).OfCategoryId(...).WhereElementIsNotElementType()
-    .FirstElement()`` - a fast, indexed quick-filter per candidate category -
-    rather than walking every element in the document once and reading its
-    `.Category` property, which would mean one full linear pass over
-    potentially the entire (federated) model just to populate a picker list.
+    Eligibility is checked with a real geometry read (ticket 1013): for up to
+    the first 25 instances of the category (collector order, no special
+    sort), call ``element.get_Geometry(Options())`` (default ``DetailLevel``,
+    ``ComputeReferences`` left False - this is a read-only presence check,
+    not a selection/reference use case) and look for at least one ``Solid``
+    with ``Volume > 0``, recursing exactly one level into any
+    ``GeometryInstance`` via ``GetInstanceGeometry()`` - family-instance-based
+    categories (doors, duct/pipe fittings and accessories, etc.) commonly
+    expose their real solids only one level down inside the placed family
+    symbol's instance geometry, not at the top level of the element's own
+    ``GeometryElement``; skipping that one level of recursion would silently
+    treat every such category as non-eligible. The scan stops the moment a
+    qualifying solid is found (common case: the very first instance already
+    qualifies) and gives up on the category if none of the first 25 do.
+    Capping at 25 is a deliberate precision/performance trade-off, not an
+    oversight: it avoids a full linear ``get_Geometry`` scan (expensive) over
+    every instance of high-count categories like Walls, and a category where
+    all of its first 25 placed instances are genuinely non-geometric but a
+    later one isn't is not a realistic case in practice.
     """
     seen_built_in_categories = set()
+    geometry_options = Options()
+    max_instances_to_check = 25
+
+    def _has_qualifying_solid(geometry_element):
+        """True if `geometry_element` directly contains a Solid with
+        Volume > 0, or a GeometryInstance does (checked exactly one level
+        down via GetInstanceGeometry() - see the cap/recursion note in
+        _enumerate_present_categories' docstring for why one level, not
+        arbitrary depth, is the deliberate scope here)."""
+        if geometry_element is None:
+            return False
+
+        for geo_obj in geometry_element:
+            if isinstance(geo_obj, Solid):
+                try:
+                    if geo_obj.Volume > 0:
+                        return True
+                except Exception:
+                    continue
+            elif isinstance(geo_obj, GeometryInstance):
+                try:
+                    nested_geometry = geo_obj.GetInstanceGeometry()
+                except Exception:
+                    nested_geometry = None
+                if nested_geometry is None:
+                    continue
+                for nested_obj in nested_geometry:
+                    if isinstance(nested_obj, Solid):
+                        try:
+                            if nested_obj.Volume > 0:
+                                return True
+                        except Exception:
+                            continue
+        return False
 
     for category in target_doc.Settings.Categories:
         if category.CategoryType != CategoryType.Model:
@@ -1026,11 +1074,27 @@ def _enumerate_present_categories(target_doc):
         if built_in_category in seen_built_in_categories:
             continue
 
-        has_instance = FilteredElementCollector(target_doc) \
+        collector = FilteredElementCollector(target_doc) \
             .OfCategoryId(category.Id) \
-            .WhereElementIsNotElementType() \
-            .FirstElement() is not None
-        if not has_instance:
+            .WhereElementIsNotElementType()
+
+        has_qualifying_instance = False
+        instances_checked = 0
+        for element in collector:
+            if instances_checked >= max_instances_to_check:
+                break
+            instances_checked += 1
+
+            try:
+                geometry = element.get_Geometry(geometry_options)
+            except Exception:
+                geometry = None
+
+            if _has_qualifying_solid(geometry):
+                has_qualifying_instance = True
+                break
+
+        if not has_qualifying_instance:
             continue
 
         seen_built_in_categories.add(built_in_category)

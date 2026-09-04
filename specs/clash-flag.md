@@ -18,6 +18,29 @@ drove this round:
    design: an **Isolate** toggle (US-7) and a **Legend** (US-8, folded into
    the existing clash list from US-3).
 
+## Amendment (2026-09-04, round 2): category-picker geometry fix
+
+Source: live-testing feedback, grilled directly (two questions, both
+resolved) rather than a full Wayfinder round. Two concerns were raised:
+
+1. The host-model category picker was missing Doors/Windows while showing
+   categories irrelevant to clash detection, like Project Information and
+   Lines. Investigation found the picker's existing filter only checks
+   "does at least one instance of this category exist" — Doors/Windows are
+   correctly absent because this particular host model has none, but
+   Project Information and Lines incorrectly pass because they have
+   instances with no actual solid geometry to ever clash against. **Fixed**
+   by requiring real solid geometry on at least one instance — see
+   [CONTEXT.md](../CONTEXT.md)'s **Clash-Eligible Category** entry. US-1
+   below is revised.
+2. Whether Isolate (US-7) should also surface the link-side element causing
+   a clash, not just the host-side element. **Resolved: no change.** Select
+   already highlights the link-side element (cross-document references are
+   supported there, unlike Isolate), which was judged sufficient — the only
+   alternative would have meant writing into the linked file itself to fake
+   a link-side isolate, which isn't worth doing for a highlight that Select
+   already provides. Added to "Explicitly out of scope" below.
+
 ## Locked decisions carried in from Wayfinder
 - Detection: manual transform pipeline (0002, revised after Phase 7 review of ticket
   1001 found the native cross-document check couldn't be verified to apply the
@@ -33,8 +56,8 @@ drove this round:
 
 ## User stories
 
-**US-1 — Scoped run setup**
-As a BIM engineer, I want to pick which categories and which loaded linked models are checked before running, so that I control clash scope per run instead of always checking everything.
+**US-1 — Scoped run setup (revised 2026-09-04)**
+As a BIM engineer, I want to pick which categories and which loaded linked models are checked before running, so that I control clash scope per run instead of always checking everything. The category picker only lists **Clash-Eligible Categories** (see CONTEXT.md) — a category must have at least one instance with real solid geometry in that document, not merely exist — so I don't see categories like Project Information or Lines that could never actually clash, and a category that's absent (e.g. Doors/Windows) reliably means that document has none, not that the picker is broken.
 
 **US-2 — Fast, reliable detection**
 As a BIM engineer, I want clash detection across the host model and my selected links to be geometrically correct — explicitly accounting for each link's placement transform — so that I don't get missed or phantom clashes because of how a link happens to be positioned. (Revised after Phase 7 review: uses a bbox pre-filter + explicit link-transform + solid intersection pipeline for the cross-document case, rather than trusting the native check to handle link transforms automatically.)
@@ -61,3 +84,4 @@ As a BIM engineer, I want a color swatch shown next to each entry in the clash l
 - Tolerance / near-miss (soft) clash detection — only hard clashes via the native check.
 - Export to Excel/CSV or integration into the Revit Warning Analysis System — the chosen UI is interactive-in-Revit, not report-based. Can be a follow-up ticket later if wanted.
 - Performance tuning/spatial partitioning — deferred per US context above; native API assumed fast enough until proven otherwise on a real model.
+- Isolating (or otherwise visually distinguishing beyond Select's existing highlight) the link-side element of a clash — evaluated 2026-09-04 and explicitly declined; Select already highlights it, and the only path to more than that would mean writing into the linked file to fake a link-side isolate.
