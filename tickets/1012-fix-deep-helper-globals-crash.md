@@ -393,3 +393,25 @@ live-deployed `script.py` - identical (`5c389d7d297d689bd041b5c62db11d5a`). Clos
 **Next step:** live retest by the user - Colorize, Isolate, AND camera fly-to/navigation
 (the latter was never reported broken but reads the same way and was fixed here on that
 basis, not yet independently confirmed against a real click).
+
+## Hotfix (2026-09-04, post-close): camera fly-to's own closure hit a related bug
+
+Live retest after this ticket's fix confirmed Colorize and Isolate both work. Camera
+fly-to/navigation then threw a NEW error: `name 'camera_reframe_fn' is not defined` -
+inside `_on_clash_selection_changed`'s nested `_reframe` closure, which reads
+`camera_reframe_fn`/`camera_reframe_doc`/`camera_reframe_uidoc`/`camera_reframe_deps` as
+free variables from its enclosing function's scope (itself a closure over `__main__`'s
+locals) - a closure nested TWO levels deep (`__main__` -> `_on_clash_selection_changed` ->
+`_reframe`), unlike every other closure this project has fixed so far (always exactly ONE
+level: a class method's locals -> one nested closure). Fixed by binding those four values
+as **default argument values** on `_reframe` instead of reading them as free variables at
+call time - this forces their evaluation to happen while `_on_clash_selection_changed` is
+running (a plain, already-proven-reliable one-hop closure read of `__main__`'s locals), so
+`_reframe`'s body then reads them as ordinary parameters (never a two-hop lookup at
+`_RevitApiBridge.Execute()` time). Same idiom this file already uses elsewhere
+(`_on_link_toggled(sender, args, entry=entry)` in `ScopePickerWindow`) for an unrelated but
+structurally similar "capture safely" need.
+
+Verified: `python -m py_compile` clean, deployed and md5-confirmed identical to the live
+pyRevit install. Not yet independently re-confirmed against a live click (that's the user's
+next retest) - flagging rather than claiming full verification.

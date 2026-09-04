@@ -3465,7 +3465,30 @@ if __name__ == "__main__":
                     if clash_result is None:
                         return
 
-                    def _reframe():
+                    # Bound as DEFAULT ARGUMENT VALUES, not read as free
+                    # variables inside the body - live retesting found that a
+                    # closure nested two levels deep (__main__ -> this
+                    # function -> _reframe) reading its enclosing values via
+                    # normal LOAD_DEREF at CALL time (i.e. inside
+                    # _RevitApiBridge.Execute()) throws the same
+                    # UnboundNameException class of error this file has
+                    # already hit repeatedly (tickets 1011/1012), even though
+                    # every ONE-hop closure elsewhere in this file (e.g.
+                    # colorize_checkbox_checked's _apply reading its own
+                    # host_doc/bridge locals) works fine. Binding these as
+                    # default values forces them to be evaluated NOW, while
+                    # this function is running (a plain, successful one-hop
+                    # closure read of __main__'s locals) - _reframe's body
+                    # then reads them as ordinary parameters (LOAD_FAST),
+                    # never as a two-hop free-variable lookup at Execute()
+                    # time.
+                    def _reframe(
+                        clash_result=clash_result,
+                        camera_reframe_fn=camera_reframe_fn,
+                        camera_reframe_doc=camera_reframe_doc,
+                        camera_reframe_uidoc=camera_reframe_uidoc,
+                        camera_reframe_deps=camera_reframe_deps,
+                    ):
                         camera_reframe_fn(
                             clash_result,
                             camera_reframe_doc,
