@@ -1067,6 +1067,15 @@ class ScopePickerWindow(forms.WPFWindow):
         self.confirmed = False
         self.result = None  # ScopeSelection, set only when confirmed
 
+        # T-11 (ticket 1011) fix: `run_button_click` is wired to the XAML
+        # `Click=` event, so (per tickets/1011-fix-event-handler-globals-
+        # crash.md's root-cause writeup) its `func_globals` is broken and a
+        # bare `forms` reference there would raise
+        # IronPython.Runtime.UnboundNameException - captured here, in
+        # __init__ (not delegate-wired, so it has this module's real
+        # globals), and read back via `self._forms` there instead.
+        self._forms = forms
+
         self._build_host_categories_ui()
         self._build_links_ui()
 
@@ -1164,6 +1173,13 @@ class ScopePickerWindow(forms.WPFWindow):
         self.LinksStack.Children.Add(container)
 
     def run_button_click(self, sender, args):
+        # T-11 (ticket 1011) fix: this method is wired to the XAML `Click=`
+        # event, so its `func_globals` is broken (see tickets/1011-fix-
+        # event-handler-globals-crash.md) - `forms` is read from `self.
+        # _forms` (captured in __init__, which is unaffected) via this
+        # local, instead of referenced bare.
+        show_forms = self._forms
+
         host_categories = [
             built_in_category
             for checkbox, built_in_category in self.host_category_checkboxes
@@ -1183,14 +1199,14 @@ class ScopePickerWindow(forms.WPFWindow):
                 link_selections.append((entry.link_instance.Id, selected_categories))
 
         if not host_categories:
-            forms.alert(
+            show_forms.alert(
                 "Pick at least one host category before running.",
                 title="ClashFlag - scope picker",
             )
             return
 
         if not link_selections:
-            forms.alert(
+            show_forms.alert(
                 "Pick at least one loaded link, and at least one category on "
                 "it, before running.",
                 title="ClashFlag - scope picker",
@@ -2390,6 +2406,33 @@ class ClashListWindow(forms.WPFWindow):
         self.isolate_active = False
         self.isolate_view_id = None
 
+        # T-11 (ticket 1011) fix: every module-level name a delegate-wired
+        # (XAML Checked=/Unchecked=/Click=) method on this class needs is
+        # captured as a `self.*` attribute HERE, in __init__ - the one method
+        # on this class that is NOT invoked through a CLR delegate (it's an
+        # ordinary Python constructor call from show_clash_list), and so is
+        # the only method guaranteed to see this module's real globals (see
+        # tickets/1011-fix-event-handler-globals-crash.md's root-cause
+        # writeup). Every delegate-wired method below (colorize_checkbox_
+        # checked, _clear_colorize_if_active, _apply_isolate_for_clash,
+        # _clear_isolate_if_active - including their nested `_apply`/`_clear`
+        # closures) reads these back via `self.*` (captured into a local
+        # first, matching the existing `self.isolate_view_id` ->
+        # `reuse_view_id` precedent below) instead of referencing the bare
+        # module-level name directly, which would raise
+        # IronPython.Runtime.UnboundNameException the moment it's clicked in
+        # a live Revit session.
+        self._doc = doc
+        self._uidoc = uidoc
+        self._output = output
+        self._forms = forms
+        self._bridge = _revit_api_bridge
+        self._apply_colorize_overrides_fn = apply_colorize_overrides
+        self._clear_colorize_overrides_fn = clear_colorize_overrides
+        self._isolate_host_element_fn = _isolate_host_element
+        self._exit_temporary_isolate_fn = _exit_temporary_isolate
+        self._select_clash_pair_fn = select_clash_pair
+
         for clash_result in self.clash_results:
             # T-10 (US-8): each row is now a small Legend swatch (see
             # `_build_clash_list_row`) plus the same describe() label text
@@ -2423,15 +2466,30 @@ class ClashListWindow(forms.WPFWindow):
         docstring's "SECOND RESEARCHED-NOT-GUESSED SUBTLETY"), so the actual
         work is queued through ``_revit_api_bridge`` and runs later, back
         in a valid context, via ``_RevitApiBridge.Execute``.
+
+        T-11 (ticket 1011) fix: this method is wired to the XAML `Checked=`
+        event, so its (and its nested `_apply` closure's) `func_globals` is a
+        broken, near-empty dict (see tickets/1011-fix-event-handler-globals-
+        crash.md) - every module-level name this method/closure needs is
+        therefore read from a `self.*` attribute (captured into a local
+        here, at the top of the OUTER method, so the nested closure below
+        picks it up via its normal enclosing-scope cell mechanism) instead of
+        referenced bare.
         """
+        host_doc = self._doc
+        apply_overrides_fn = self._apply_colorize_overrides_fn
+        show_forms = self._forms
+        print_output = self._output
+        bridge = self._bridge
+
         def _apply():
-            active_view = doc.ActiveView
+            active_view = host_doc.ActiveView
             try:
-                previous_overrides = apply_colorize_overrides(
-                    self.clash_results, doc, active_view
+                previous_overrides = apply_overrides_fn(
+                    self.clash_results, host_doc, active_view
                 )
             except Exception as colorize_error:
-                forms.alert(
+                show_forms.alert(
                     "ClashFlag could not apply colorize overrides: {0}".format(
                         colorize_error
                     ),
@@ -2448,7 +2506,7 @@ class ClashListWindow(forms.WPFWindow):
             self.colorize_previous_overrides = previous_overrides
             self.colorize_view_id = active_view.Id
             self.colorize_active = True
-            output.print_md(
+            print_output.print_md(
                 "_ClashFlag: colorize by category is ON - host-side "
                 "clashing elements only. Revit has no API to override an "
                 "individual linked element's graphics from a host view "
@@ -2456,7 +2514,7 @@ class ClashListWindow(forms.WPFWindow):
                 "so link-side elements are left untouched._"
             )
 
-        _revit_api_bridge.raise_action(_apply)
+        bridge.raise_action(_apply)
 
     def colorize_checkbox_unchecked(self, sender, args):
         """Turn colorize-by-category OFF: restore every host element this
@@ -2486,9 +2544,21 @@ class ClashListWindow(forms.WPFWindow):
         `view` back via `doc.GetElement`, calling `clear_colorize_overrides`)
         still has to happen later, in a valid API context, via the bridge -
         that part is queued exactly like colorize_checkbox_checked's apply.
+
+        T-11 (ticket 1011) fix: like colorize_checkbox_checked, this method
+        (and its nested `_clear` closure) is reached from a delegate-wired
+        handler (`colorize_checkbox_unchecked`, and indirectly `show_clash_
+        list`'s Closed handler) with broken `func_globals` - every
+        module-level name needed is read from a `self.*` attribute, captured
+        into a local at the top of this method, instead of referenced bare.
         """
         if not self.colorize_active:
             return
+
+        host_doc = self._doc
+        print_output = self._output
+        clear_overrides_fn = self._clear_colorize_overrides_fn
+        bridge = self._bridge
 
         view_id = self.colorize_view_id
         previous_overrides = self.colorize_previous_overrides
@@ -2497,23 +2567,23 @@ class ClashListWindow(forms.WPFWindow):
         self.colorize_view_id = None
 
         def _clear():
-            view = doc.GetElement(view_id) if view_id else None
+            view = host_doc.GetElement(view_id) if view_id else None
             if view is not None:
                 try:
-                    clear_colorize_overrides(doc, view, previous_overrides)
+                    clear_overrides_fn(host_doc, view, previous_overrides)
                 except Exception as clear_error:
-                    output.print_md(
+                    print_output.print_md(
                         "_ClashFlag: failed to fully clear colorize "
                         "overrides: {0}_".format(clear_error)
                     )
             else:
-                output.print_md(
+                print_output.print_md(
                     "_ClashFlag: the view colorize was applied to no "
                     "longer exists - its overrides could not be explicitly "
                     "cleared (they went away with the view itself)._"
                 )
 
-        _revit_api_bridge.raise_action(_clear)
+        bridge.raise_action(_clear)
 
     def isolate_checkbox_checked(self, sender, args):
         """Turn Isolate ON (US-7 / ticket 1009) for the CURRENT clash - see
@@ -2587,9 +2657,25 @@ class ClashListWindow(forms.WPFWindow):
         is currently "the current clash" (can only happen transiently, e.g.
         `current_index` momentarily out of range) - there is nothing to
         isolate.
+
+        T-11 (ticket 1011) fix: this method (reached from the delegate-wired
+        `isolate_checkbox_checked` and, on later navigation, `on_selection_
+        changed`) and its nested `_apply` closure have broken `func_globals`
+        - every module-level name needed (`doc`, `output`, `uidoc`,
+        `_isolate_host_element`, `select_clash_pair`, `_revit_api_bridge`) is
+        therefore read from a `self.*` attribute, captured into a local at
+        the top of this method (alongside the existing `reuse_view_id`
+        capture below) instead of referenced bare.
         """
         if clash_result is None:
             return
+
+        host_doc = self._doc
+        host_uidoc = self._uidoc
+        print_output = self._output
+        isolate_host_element_fn = self._isolate_host_element_fn
+        select_clash_pair_fn = self._select_clash_pair_fn
+        bridge = self._bridge
 
         # None only on the very first apply of a session (see docstring
         # above) - captured here, in the raw handler body, not inside the
@@ -2603,9 +2689,9 @@ class ClashListWindow(forms.WPFWindow):
 
         def _apply():
             if reuse_view_id is not None:
-                view = doc.GetElement(reuse_view_id)
+                view = host_doc.GetElement(reuse_view_id)
                 if view is None:
-                    output.print_md(
+                    print_output.print_md(
                         "_ClashFlag: the view Isolate was applied to no "
                         "longer exists - turning Isolate off._"
                     )
@@ -2614,12 +2700,12 @@ class ClashListWindow(forms.WPFWindow):
                     self.IsolateCheckBox.IsChecked = False
                     return
             else:
-                view = doc.ActiveView
+                view = host_doc.ActiveView
 
             try:
-                _isolate_host_element(doc, view, clash_result.host_element.Id)
+                isolate_host_element_fn(host_doc, view, clash_result.host_element.Id)
             except Exception as isolate_error:
-                output.print_md(
+                print_output.print_md(
                     "_ClashFlag: could not isolate this clash's host "
                     "element: {0}_".format(isolate_error)
                 )
@@ -2638,7 +2724,7 @@ class ClashListWindow(forms.WPFWindow):
             # element can't be isolated (same API ceiling as colorize's
             # host-only override limitation), so Select keeps it findable
             # inside the still-fully-visible link model.
-            select_clash_pair(clash_result, doc, uidoc)
+            select_clash_pair_fn(clash_result, host_doc, host_uidoc)
 
             if is_first_apply_in_session:
                 # Printed once per session (first check), not on every
@@ -2648,7 +2734,7 @@ class ClashListWindow(forms.WPFWindow):
                 # navigation step" reasoning, taken one step further here:
                 # a routine SUCCESS note on every single step would drown
                 # out the genuinely useful per-step failure notes above.
-                output.print_md(
+                print_output.print_md(
                     "_ClashFlag: Isolate is ON - hides everything in this "
                     "view except this clash's host-side element. The "
                     "link-side element can't be isolated (same Revit API "
@@ -2658,7 +2744,7 @@ class ClashListWindow(forms.WPFWindow):
                     "restores full visibility._"
                 )
 
-        _revit_api_bridge.raise_action(_apply)
+        bridge.raise_action(_apply)
 
     def _clear_isolate_if_active(self):
         """Shared by `isolate_checkbox_unchecked` above AND
@@ -2679,18 +2765,30 @@ class ClashListWindow(forms.WPFWindow):
         near-simultaneous call must see `isolate_active` already False and
         no-op, rather than queue a second, redundant
         `DisableTemporaryViewMode` call.
+
+        T-11 (ticket 1011) fix: like `_clear_colorize_if_active`, this method
+        (and its nested `_clear` closure) is reached from a delegate-wired
+        handler (`isolate_checkbox_unchecked`, and indirectly `show_clash_
+        list`'s Closed handler) with broken `func_globals` - every
+        module-level name needed is read from a `self.*` attribute, captured
+        into a local at the top of this method, instead of referenced bare.
         """
         if not self.isolate_active:
             return
+
+        host_doc = self._doc
+        print_output = self._output
+        exit_temporary_isolate_fn = self._exit_temporary_isolate_fn
+        bridge = self._bridge
 
         view_id = self.isolate_view_id
         self.isolate_active = False
         self.isolate_view_id = None
 
         def _clear():
-            view = doc.GetElement(view_id) if view_id else None
+            view = host_doc.GetElement(view_id) if view_id else None
             if view is None:
-                output.print_md(
+                print_output.print_md(
                     "_ClashFlag: the view Isolate was applied to no longer "
                     "exists - its Temporary Isolate mode could not be "
                     "explicitly cleared (it went away with the view "
@@ -2698,14 +2796,14 @@ class ClashListWindow(forms.WPFWindow):
                 )
                 return
             try:
-                _exit_temporary_isolate(doc, view)
+                exit_temporary_isolate_fn(host_doc, view)
             except Exception as clear_error:
-                output.print_md(
+                print_output.print_md(
                     "_ClashFlag: failed to fully exit Temporary Isolate "
                     "mode: {0}_".format(clear_error)
                 )
 
-        _revit_api_bridge.raise_action(_clear)
+        bridge.raise_action(_clear)
 
     def _on_list_selection_changed(self, sender, args):
         """The one place ``current_index`` ever changes. Fires for direct
