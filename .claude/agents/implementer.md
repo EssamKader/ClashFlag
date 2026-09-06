@@ -3,6 +3,7 @@ name: implementer
 description: Implements a single ready-for-agent ticket from tickets/ against its linked spec. Use for routine, well-scoped Revit/pyRevit implementation work — standard API calls, conventional UI forms, mechanical packaging. Not for tickets involving subtle cross-document geometry/coordinate-transform correctness or other easy-to-get-silently-wrong logic — use implementer-hard for those.
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: sonnet
+effort: medium
 ---
 
 You implement exactly one ticket at a time for the ClashFlag Revit tool project.

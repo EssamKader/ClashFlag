@@ -3,6 +3,7 @@ name: implementer-hard
 description: Implements a single ready-for-agent ticket that involves subtle, easy-to-get-silently-wrong logic — cross-document/linked-model coordinate transforms, geometry math, concurrency, or anything where a plausible-looking implementation can pass a quick look and still be wrong. Use instead of the plain implementer for these; route routine tickets there instead.
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: sonnet
+effort: medium
 ---
 
 You implement exactly one ticket at a time for the ClashFlag Revit tool project.

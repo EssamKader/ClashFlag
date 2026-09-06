@@ -1,0 +1,39 @@
+name: IronPython 2.7 syntax check
+
+on:
+  pull_request:
+    paths:
+      - 'ClashFlag.extension/**/*.py'
+
+jobs:
+  py27-syntax-check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # pyRevit runs on IronPython 2.7, so real CPython 2.7 is the closest
+      # available proxy for "does this still parse as valid Python 2.7
+      # syntax" (f-strings, walrus, py3-only type hints, etc. all fail here
+      # exactly like they would under IronPython). GitHub's setup-python
+      # still ships a cached 2.7 build for this runner image; if that build
+      # is ever retired, replace this step with a manual `apt-get install
+      # python2` or a deadsnakes-ppa install of python2.7.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '2.7'
+
+      - name: Compile every script.py under Python 2.7
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          files=(ClashFlag.extension/**/*.py)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No .py files found under ClashFlag.extension - nothing to check."
+            exit 0
+          fi
+          status=0
+          for f in "${files[@]}"; do
+            echo "Checking $f"
+            python -m py_compile "$f" || status=1
+          done
+          exit $status
