@@ -12,45 +12,59 @@ element, since Revit's selection API supports cross-document references.
 _Avoid_: Isolate, highlight, focus
 
 **Isolate**:
-Temporarily hiding every element in the view except one clash's two
-elements — both the host-side AND the link-side element, full parity with
-Navisworks' own clash-isolate behavior (revised 2026-09-07; previously
-host-side only). Host-side isolation uses Revit's native Temporary Isolate mode
-(`View.IsolateElementsTemporary`), unchanged since ticket 1009. Link-side
-isolation (revised again, ticket 1018, superseding an abandoned
-`PostCommand`-based approach from ticket 1017 — see that ticket's own
-"Superseded" note for why) uses a **Section Box**
-(`View3D.SetSectionBox`/`IsSectionBoxActive`): a 3D region, tightly padded
-around the combined bounding box of both clashing elements, that crops
-geometry uniformly across the host document AND every linked model at the
-view-rendering level, with no awareness of document boundaries at all — so
-every other pipe/element outside that region simply doesn't render, without
-ClashFlag ever needing to identify or hide link elements one by one. This
-reuses the exact `_combined_host_space_bounding_box`/`_pad_bounding_box`
-math already built for camera fly-to (ticket 1004), and — unlike the
-abandoned approach — is a normal synchronous, `Transaction`-wrapped API
-call, the same shape as every other feature in this tool. **Known,
-accepted trade-off**: a section box crops by 3D region, not by element
-identity — a different, non-clashing element that happens to sit physically
-close to the clash (e.g. a parallel pipe in the same MEP corridor) can still
-appear inside the box. Only works on a `View3D`; if the active view isn't
-one, link-side isolation is skipped with a console note (host isolation
-still applies) — see US-7's "not a 3D view" handling, same posture camera
-fly-to already has. An opt-in toggle, not
+Temporarily hiding every element in the HOST view except one clash's
+host-side element (Revit's native Temporary Isolate mode,
+`View.IsolateElementsTemporary`) — host-side only, unchanged since ticket
+1009. Two link-side approaches were tried and superseded before this
+settled here: ticket 1017's `PostCommand`-based per-element hide (abandoned
+before shipping — see that ticket's "Superseded" note), then ticket 1018's
+attempt to bundle a Section Box into this same checkbox (reverted, ticket
+1019 — a section box sized to the FULL host+link elements barely cropped
+anything when one element was much larger than the other, e.g. a large
+floor slab vs. a small pipe, and bundling it into Isolate removed the
+ability to use it without also hiding host elements). Isolate itself is
+back to exactly its original ticket-1009 scope; link-side focus now lives
+entirely in the separate **Section Box** entry below. An opt-in toggle, not
 ClashFlag's default behavior. Stepping to a different clash while Isolate is
-on *replaces* the isolation on both sides (never accumulates a working set
-across clashes). Independent of Colorize: turning Isolate on never forces
-the isolated element into its category-pair color, and turning Colorize on
-never isolates anything — a user can toggle either, both, or neither.
-Turning Isolate on still always also Selects both elements of the current
-clash, unchanged from before — no longer load-bearing for "findability"
-now that the link element is genuinely visible on its own, but kept as
-matching, deliberately-unchanged host-side behavior per the 2026-09-07
-Wayfinder round's explicit choice not to touch it. Turning Isolate off, or
-closing the clash-list window while it's on, immediately exits Temporary
-Isolate mode on the host AND restores every hidden link element (same
-lifecycle as Colorize's clear-on-uncheck/close).
+on *replaces* the isolation (never accumulates). Independent of Colorize
+and Section Box: turning Isolate on never forces the isolated element into
+its category-pair color and never affects the section box, and vice versa —
+a user can toggle any combination. Turning Isolate on always also Selects
+both elements of the current clash (unchanged since ticket 1009 — the
+link-side element still can't itself be isolated, so this keeps it findable).
+Turning Isolate off, or closing the clash-list window while it's on,
+immediately exits Temporary Isolate mode and restores the full host view.
 _Avoid_: Select, highlight, focus
+
+**Section Box**:
+An opt-in toggle, independent of Isolate and Colorize (own checkbox, own
+on/off lifecycle — added 2026-09-07, ticket 1019, after being tried and
+reverted as part of Isolate in ticket 1018), that crops the active 3D
+view's Section Box tightly around the CLASH ITSELF — not the two full
+elements. Sized from the actual intersection geometry the detection engine
+already computes to confirm the clash (`BooleanOperationsUtils.
+ExecuteBooleanOperation(..., Intersect)` in `solids_clash`, captured onto
+`ClashResult` at detection time rather than discarded), padded by a small
+margin — so the box stays small and centered on the true clash point
+regardless of whether the host element, the link element, or neither is
+large. This is the fix for Isolate's own now-superseded Section Box attempt
+(1018), which sized the box to the two FULL elements' combined bounding box
+and barely cropped anything when one side (e.g. a large floor slab) dwarfed
+the other (e.g. a small pipe). Crops geometry uniformly across host and
+every linked model at the view-rendering level, with no per-element
+identification needed — every other element outside that small region
+simply doesn't render, in either model. **Known, accepted trade-off,
+unchanged from 1018's original finding**: crops by 3D region, not by
+element identity — a different, non-clashing element that happens to sit
+physically close to the clash (e.g. a parallel pipe in the same MEP
+corridor) can still appear inside the box. Only works on a `View3D`; if the
+active view isn't one, turning Section Box on is skipped with a console
+note. Stepping to a different clash while it's on replaces the box, never
+accumulates. Turning it off, or closing the clash-list window while it's
+on, immediately restores full visibility (`IsSectionBoxActive = False`).
+_Avoid_: Isolate — a section box crops a 3D region; Isolate hides specific
+elements. They compose (both can be on together) but are not the same
+concept and no longer share a checkbox.
 
 **Category Pair**:
 The unordered pair of Revit Categories on either side of one clash (e.g.

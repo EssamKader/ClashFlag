@@ -46,6 +46,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <TextBlock Grid.Row="0"
@@ -76,26 +77,52 @@
                   ToolTip="Color-codes each clash's HOST-side element by its host/link category pair, consistently across the current result set. Linked-side elements can't be colorized this way - Revit has no API to override an individual linked element's graphics from a host view."/>
 
         <!--
-        T-9 / ticket 1009 (US-7): Isolate toggle. Applies to the CURRENT
-        clash only (unlike ColorizeCheckBox above, which applies to the
-        whole result set at once) - hides everything else in the active
-        view and always also selects/highlights both elements, since the
-        link-side element can't itself be isolated (same researched Revit
-        API limitation as colorize's host-only scope). See
-        ClashListWindow.isolate_checkbox_checked/_unchecked in script.py for
-        the full lifecycle - mirrors ColorizeCheckBox's exact
-        apply-on-check/clear-on-uncheck/clear-on-Closed pattern, but also
-        re-applies on every Next/Previous/list-click navigation while
-        checked, since "the current clash" itself changes underneath it.
+        T-9 / ticket 1009 (US-7, HOST-ONLY SCOPE RESTORED BY TICKET 1019):
+        Isolate toggle. Applies to the CURRENT clash only (unlike
+        ColorizeCheckBox above, which applies to the whole result set at
+        once) - hides everything else in the active view and always also
+        selects/highlights both elements, since the link-side element can't
+        itself be isolated (same researched Revit API limitation as
+        colorize's host-only scope). See ClashListWindow.isolate_checkbox_
+        checked/_unchecked in script.py for the full lifecycle - mirrors
+        ColorizeCheckBox's exact apply-on-check/clear-on-uncheck/
+        clear-on-Closed pattern, but also re-applies on every
+        Next/Previous/list-click navigation while checked, since "the
+        current clash" itself changes underneath it. Ticket 1018 briefly
+        bundled a link-side Section Box into this same checkbox; ticket 1019
+        reverted that (see SectionBoxCheckBox below) - this checkbox is back
+        to its original ticket-1009 host-only scope, independent of Section
+        Box and Colorize.
         -->
         <CheckBox Grid.Row="4" x:Name="IsolateCheckBox"
                   Content="Isolate current clash"
                   Margin="0,0,0,8"
                   Checked="isolate_checkbox_checked"
                   Unchecked="isolate_checkbox_unchecked"
-                  ToolTip="Hides everything in the active view except this clash's HOST-side element, and always also selects/highlights both elements (the link-side element can't be isolated this way - Select keeps it findable). Moving to a different clash replaces the isolation; turning this off restores full visibility."/>
+                  ToolTip="Hides everything in the active view except this clash's HOST-side element, and always also selects/highlights both elements (the link-side element can't be isolated this way - Select keeps it findable). Moving to a different clash replaces the isolation; turning this off restores full visibility. Independent of Section Box and Colorize."/>
 
-        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+        <!--
+        T-19 / ticket 1019 (US-9): Section Box toggle - independent of
+        Isolate (above) and Colorize. Crops the active 3D view tightly
+        around the CURRENT clash's actual intersection region (not the two
+        full clashing elements - see this ticket's fix for why ticket 1018's
+        attempt, sized to the two full elements, barely cropped anything
+        when one dwarfed the other), across both the host and every linked
+        model, at the view-rendering level. Only works on a View3D - skipped
+        with a console note otherwise. See ClashListWindow.section_box_
+        checkbox_checked/_unchecked in script.py for the full lifecycle -
+        mirrors IsolateCheckBox's exact apply-on-check/clear-on-uncheck/
+        clear-on-Closed/re-apply-on-navigation pattern, with its own,
+        completely independent state.
+        -->
+        <CheckBox Grid.Row="5" x:Name="SectionBoxCheckBox"
+                  Content="Section Box on current clash"
+                  Margin="0,0,0,8"
+                  Checked="section_box_checkbox_checked"
+                  Unchecked="section_box_checkbox_unchecked"
+                  ToolTip="Crops the active 3D view tightly around this clash's actual intersection region, in both the host and linked model - not the two full elements' extents. Only works on a 3D view. Moving to a different clash replaces the box; turning this off restores full visibility. Independent of Isolate and Colorize."/>
+
+        <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="PreviousButton" Content="Previous" Width="90" Height="28" Margin="0,0,8,0"
                     Click="previous_button_click"/>
             <Button x:Name="NextButton" Content="Next" Width="90" Height="28" Margin="0,0,8,0"

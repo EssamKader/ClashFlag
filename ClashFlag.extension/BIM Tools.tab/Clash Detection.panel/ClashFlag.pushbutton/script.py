@@ -908,6 +908,41 @@ def solids_clash(solid_a, solid_b):
     """Confirm a REAL (non-zero-volume) intersection between two solids that
     are both already known to be in the same coordinate space (host space).
 
+    Returns a 3-tuple ``(is_clash, intersection_min, intersection_max)``:
+    - ``is_clash`` (bool): unchanged decision logic from before ticket 1019 -
+      still exactly ``result_solid.Volume > MIN_CLASH_VOLUME_FEET3`` (or
+      ``False`` on any exception/``None`` result) - NOT touched by this
+      ticket, only what's returned ALONGSIDE it.
+    - ``intersection_min``/``intersection_max`` (both ``XYZ``, host space, or
+      both ``None``): the actual overlap region's own axis-aligned bounding
+      box - added in ticket 1019 (T-19, US-9) so the caller can size a
+      Section Box tightly around the real clash point instead of the two
+      full clashing elements. Computed by handing `result_solid` - the exact
+      boolean-intersection solid already computed above to make the
+      is_clash decision, previously discarded right after - to the SAME
+      ``_outline_for_solid`` helper every other solid-to-bbox conversion in
+      this file already uses (rotation-safe: transforms all 8 corners of the
+      solid's own local bbox frame, not just the two extreme ones - see that
+      function's docstring for why "just the two corners" can under-cover a
+      rotated/mirrored solid). Deliberately NOT a second, simpler bbox
+      extraction - reusing the already-reviewed one keeps this file from
+      ever having two different (and possibly subtly disagreeing)
+      techniques for "solid -> host-space bounding box".
+    - Both are ``None`` whenever ``is_clash`` is ``False`` (nothing to
+      report), AND in the rare case ``is_clash`` is ``True`` but
+      ``_outline_for_solid`` itself couldn't produce a box for the
+      intersection solid (e.g. a degenerate/malformed result -
+      ``Solid.GetBoundingBox()`` returning ``None``) - callers must treat a
+      ``None`` pair as "no intersection box available", not as "not a
+      clash": the clash confirmation and the box extraction are two
+      separate steps that can fail independently.
+
+    A LIVE ``Solid`` reference (``result_solid`` itself) is never returned or
+    held anywhere past this function - only its own two ``XYZ`` corner
+    points, which is all any caller (``find_clashing_pairs``, then
+    ``ClashResult``) needs, per the ticket's explicit "do not keep a live
+    Solid reference alive past the detection pass" instruction.
+
     Boolean operations can throw on some legitimate-looking solid inputs
     (coincident/self-intersecting faces, short-curve-tolerance edge cases,
     etc.) - per the ticket, this is wrapped defensively so one bad geometry
@@ -920,21 +955,42 @@ def solids_clash(solid_a, solid_b):
             solid_a, solid_b, BooleanOperationsType.Intersect
         )
     except Exception:
-        return False
+        return False, None, None
 
     if result_solid is None:
-        return False
+        return False, None, None
 
     try:
-        return result_solid.Volume > MIN_CLASH_VOLUME_FEET3
+        is_clash = result_solid.Volume > MIN_CLASH_VOLUME_FEET3
     except Exception:
-        return False
+        return False, None, None
+
+    if not is_clash:
+        return False, None, None
+
+    intersection_outline = _outline_for_solid(result_solid)
+    if intersection_outline is None:
+        # A real clash, but its own intersection box couldn't be extracted -
+        # per this function's docstring, the caller must not confuse this
+        # with "not a clash".
+        return True, None, None
+
+    return True, intersection_outline.MinimumPoint, intersection_outline.MaximumPoint
 
 
 def find_clashing_pairs(host_candidates, link_candidates):
     """Given (element, [host-space solids]) lists for both sides, return the
-    list of (host_element, link_element) pairs with at least one confirmed
-    solid-solid clash.
+    list of (host_element, link_element, intersection_min, intersection_max)
+    tuples with at least one confirmed solid-solid clash - the trailing two
+    entries (added in ticket 1019, both ``XYZ`` or both ``None`` - see
+    ``solids_clash``'s own docstring) are the host-space bounding box of the
+    ACTUAL overlap region for whichever solid-pair first confirmed this
+    element pair as a clash, threaded straight through from that one
+    ``solids_clash`` call (see below) rather than re-derived or unioned
+    across every solid-pair that happened to clash - per this function's own
+    "report once per element pair" contract (unchanged by this ticket),
+    there is exactly one intersection box captured per reported pair, from
+    whichever solid-pair happened to confirm it first.
 
     Every solid handled from this point on - host or link-derived - is
     already in host coordinate space (guaranteed by collect_candidate_solids),
@@ -974,6 +1030,8 @@ def find_clashing_pairs(host_candidates, link_candidates):
                 continue
 
             found_clash_for_pair = False
+            intersection_min = None
+            intersection_max = None
 
             for link_solid in link_solids:
                 link_outline = _outline_for_solid(link_solid)
@@ -984,8 +1042,11 @@ def find_clashing_pairs(host_candidates, link_candidates):
                     if not host_outline.Intersects(link_outline, BBOX_OVERLAP_TOLERANCE_FEET):
                         continue
 
-                    if solids_clash(host_solid, link_solid):
+                    is_clash, clash_min, clash_max = solids_clash(host_solid, link_solid)
+                    if is_clash:
                         found_clash_for_pair = True
+                        intersection_min = clash_min
+                        intersection_max = clash_max
                         break
 
                 if found_clash_for_pair:
@@ -993,7 +1054,9 @@ def find_clashing_pairs(host_candidates, link_candidates):
 
             if found_clash_for_pair:
                 reported_pair_ids.add(pair_key)
-                clashing_pairs.append((host_element, link_element))
+                clashing_pairs.append(
+                    (host_element, link_element, intersection_min, intersection_max)
+                )
 
     return clashing_pairs
 
@@ -1412,23 +1475,64 @@ class ClashResult(object):
       .NET object reference staying valid/meaningful for as long as the
       modeless clash list window stays open, across whatever else happens in
       the Revit session meanwhile.
+    - intersection_min / intersection_max (added ticket 1019, T-19, US-9):
+      both plain ``XYZ`` objects in HOST space, or both ``None`` - the actual
+      overlap region's own bounding box, threaded straight through from
+      ``find_clashing_pairs``'s own trailing two tuple entries (see that
+      function's and ``solids_clash``'s docstrings for the full derivation).
+      Deliberately NOT a live ``Solid`` reference - per the ticket's explicit
+      instruction, no Solid is kept alive past the detection pass; only its
+      two corner ``XYZ`` points are carried forward, which is all
+      ``_apply_section_box_for_clash`` (T-19's fixed Section Box sizing,
+      superseding ticket 1018's "combined FULL elements" box) needs. Can be
+      ``None`` for a ``ClashResult`` whose intersection box couldn't be
+      extracted at detection time (see ``solids_clash``'s docstring for that
+      narrow case) - every consumer must handle that, not assume it's always
+      present.
     """
 
-    def __init__(self, host_element, link_element, link_name, link_instance_id):
+    def __init__(
+        self,
+        host_element,
+        link_element,
+        link_name,
+        link_instance_id,
+        intersection_min=None,
+        intersection_max=None,
+    ):
         self.host_element = host_element
         self.link_element = link_element
         self.link_name = link_name
         self.link_instance_id = link_instance_id
+        # T-19 (ticket 1019): see class docstring above. Both default to
+        # `None` (rather than being required positional args) so a
+        # ``ClashResult`` can still be constructed without them - the same
+        # "handle the missing case, don't assume it's always there" posture
+        # ``_apply_section_box_for_clash`` itself is required to take for
+        # these two values.
+        self.intersection_min = intersection_min
+        self.intersection_max = intersection_max
 
     def describe(self):
         """One-line display string for this clash, used as a ListBox row in
         ClashListWindow. Reuses describe_element() for both sides, same as
         the existing per-link console reporting below, so the panel and the
-        console output describe elements identically."""
-        return "Host: {0}   <->   Link [{1}]: {2}".format(
+        console output describe elements identically.
+
+        T-19 (ticket 1019, US-3 revised): each side's Revit Element ID
+        (``Id.IntegerValue``) is now appended in ``[id N]`` form, so a user
+        can reference a specific clashing element precisely (e.g. telling a
+        builder exactly which pipe to move) without switching to Revit's own
+        Element ID lookup - applied identically to both the host and link
+        side, per the ticket's "apply consistently to both sides"
+        instruction.
+        """
+        return "Host: {0} [id {1}]   <->   Link [{2}]: {3} [id {4}]".format(
             describe_element(self.host_element),
+            self.host_element.Id.IntegerValue,
             self.link_name,
             describe_element(self.link_element),
+            self.link_element.Id.IntegerValue,
         )
 
 
@@ -2454,156 +2558,127 @@ def _exit_temporary_isolate(host_doc, view, deps):
 
 
 # ---------------------------------------------------------------------------
-# ISOLATE LINK VIA SECTION BOX (T-18 / ticket 1018)
+# SECTION BOX FOCUSED ON THE CLASH (T-19 / ticket 1019, US-9)
 #
-# US-7 (revised 2026-09-07, superseding ticket 1017's abandoned
-# PostCommand-based hide sequencer - see tickets/1017-isolate-link-element-
-# via-hide.md's "Superseded" note): alongside the UNCHANGED host-side
-# Temporary Isolate above, crop the active 3D view with a View3D Section Box
-# tightly padded around the COMBINED bounding box of the current clash's
-# host AND link elements. A section box crops geometry uniformly at the
-# view-rendering level, across the host document AND every linked model,
-# with no per-element identification needed at all - so every other
-# pipe/element outside that region simply doesn't render, without ClashFlag
-# ever needing to hide a specific link-side element by identity (the
-# approach ticket 1017 built and then abandoned before it shipped).
+# REOPENS ticket 1018 - see that ticket's Implementation section and this
+# ticket's own header for the two live-testing problems found:
+#   1. WRONG BOX SOURCE: 1018 sized the box to
+#      ``_combined_host_space_bounding_box`` - the COMBINED bounding box of
+#      the two FULL clashing elements. When one element dwarfs the other
+#      (e.g. a large floor slab vs. a small pipe), that combined box is
+#      dominated by the large element and barely crops anything - the whole
+#      point of a focus box is defeated. FIXED below: sized instead from
+#      `clash_result.intersection_min`/`intersection_max` - the ACTUAL
+#      overlap region's own (small-by-construction) bounding box, captured
+#      at detection time by ticket 1019's part 1 (see `solids_clash`/
+#      `find_clashing_pairs`/`ClashResult` above) - padded the same way via
+#      `_pad_bounding_box`, but around a box that's actually tight to the
+#      clash regardless of either element's own size.
+#   2. WRONG CONTROL: 1018 bundled this into the Isolate checkbox, so a user
+#      couldn't get the tight focus box without ALSO hiding other host
+#      elements. FIXED below: split into its OWN, independent
+#      `SectionBoxCheckBox` (see `ClashListWindow.section_box_checkbox_
+#      checked`/`_unchecked` in the "CLASH LIST PANEL" section) - Isolate
+#      (`_apply_isolate_for_clash`/`_clear_isolate_if_active`) reverts to
+#      calling ONLY the host-isolate + Select helpers, exactly ticket 1009's
+#      original scope, with zero section-box calls left in its body.
 #
-# Only two small Transaction-wrapped helper functions live up here, mirroring
-# _isolate_host_element/_exit_temporary_isolate's own placement and shape
-# immediately above - the checkbox lifecycle wiring itself lives in
-# ClashListWindow._apply_isolate_for_clash/_clear_isolate_if_active (below,
-# in the "CLASH LIST PANEL" section), which now calls BOTH the host-isolate
-# helpers above AND these two, alongside each other, per the ticket's
-# explicit "add alongside, don't touch the existing bodies' isolate/
-# select calls" instruction.
+# The two Transaction-wrapped helpers below (`_apply_section_box_for_clash`/
+# `_clear_section_box`) are REUSED from 1018, not deleted/renamed - only
+# their box-source input (point 1 above) changes. The View3D guard, the
+# Transaction/rollback shape, and the "never raises for a soft skip, only for
+# a real API failure" posture are all UNCHANGED from 1018.
 #
-# SAME CAPTURED VIEW, NO SECOND TRACKING MECHANISM: this reuses
-# ClashListWindow.isolate_view_id's existing session-scoped-view capture
-# (see _apply_isolate_for_clash's own docstring for the full "capture once
-# per session, never re-read doc.ActiveView on re-apply" reasoning) - the
-# section box is always set on the SAME View3D host isolate already
-# targeted this session, never a separately tracked view.
-#
-# API CHOICE - RESEARCHED, NOT GUESSED (see tickets/1018-isolate-link-
-# section-box.md's "The mechanism" section for the source trail):
-#   - ``View3D.SetSectionBox(BoundingBoxXYZ)`` - sets the 3D crop region for
-#     the view. Confirmed via revitapidocs.com and an Autodesk Community
-#     thread on SetSectionBox. Also the SAME method ticket 1004 (camera
-#     fly-to) already researched and explicitly considered - see
-#     ``reframe_active_view_on_clash``'s own docstring, "Chosen over two
-#     other candidates" paragraph - and REJECTED there specifically because
-#     it crops the view PERSISTENTLY (a longer-lived, more invasive effect
-#     than a one-shot camera move). That exact persistence is what makes it
-#     the RIGHT tool here: Isolate is already meant to persist until the
-#     user explicitly turns it off, so "persistent" is a feature for this
-#     use, not the drawback it was for camera fly-to.
-#   - ``View3D.IsSectionBoxActive`` (bool property) - whether the section box
-#     set via SetSectionBox is actually applied/visible. Both members are
-#     View3D-only (not on the base View class), which is exactly why the
-#     isinstance(view, deps.View3D) guard below is required and cannot be
-#     skipped the way host isolate's own IsolateElementsTemporary (a plain
-#     View method, works on ANY view type) does not need one.
-#   - ``BoundingBoxXYZ`` - a plain data object with settable ``Min``/``Max``
-#     XYZ corners (default ``Transform`` is identity, which is correct here
-#     since ``_combined_host_space_bounding_box``/``_pad_bounding_box``
-#     already return axis-aligned, untransformed HOST-space corners - no
-#     extra Transform needs setting on the box itself).
-# TRANSACTED, NOT TRANSIENT UI STATE: same reasoning as
-# _isolate_host_element/_exit_temporary_isolate's own header comment above -
-# a Section Box is persisted VIEW state (survives a document save until
-# explicitly cleared), and both setting and clearing it are documented as
-# requiring an open, modifiable Transaction. Both helpers below therefore
-# open their own single, descriptively-named Transaction, with a try/except
-# that rolls back on failure, exactly mirroring the host-isolate helpers'
-# own shape immediately above.
+# API CHOICE - carried over unchanged from ticket 1018 (see that ticket's
+# "The mechanism" section for the full research trail): `View3D.
+# SetSectionBox(BoundingBoxXYZ)`, `View3D.IsSectionBoxActive` (both
+# View3D-only, hence the isinstance guard), `BoundingBoxXYZ` (identity
+# Transform is correct since `_pad_bounding_box` already returns axis-aligned,
+# untransformed HOST-space corners).
 # ---------------------------------------------------------------------------
 
 
 def _apply_section_box_for_clash(host_doc, view, clash_result, deps):
-    """Crop `view`'s Section Box to a padded box around the COMBINED bounding
-    box of `clash_result`'s host AND link elements - the link-side isolation
-    half of US-7 (ticket 1018), alongside the unchanged host-side Temporary
-    Isolate `_isolate_host_element` provides above.
+    """Crop `view`'s Section Box to a padded box around the ACTUAL
+    INTERSECTION of `clash_result`'s host and link elements - the T-19 fix
+    for US-9, sized from `clash_result.intersection_min`/`intersection_max`
+    (ticket 1019 part 1's new capture, small-by-construction since it's the
+    real overlap region, NOT the two full elements' combined extent - see
+    this module's "SECTION BOX FOCUSED ON THE CLASH" header comment above for
+    why the old `_combined_host_space_bounding_box`-based version barely
+    cropped anything when one element dwarfed the other).
 
-    Reuses ``_combined_host_space_bounding_box``/``_pad_bounding_box`` AS-IS
-    (ticket instruction #2) - the exact same two-function call
-    ``reframe_active_view_on_clash`` already makes for camera fly-to, not
-    reimplemented or approximated, padded by ``SECTION_BOX_PADDING_FRACTION``
-    (a deliberately separate constant from camera fly-to's own
-    ``CAMERA_REFRAME_PADDING_FRACTION`` - see that constant's own module-level
-    comment for the judgment call and reasoning).
+    Padded via ``_pad_bounding_box(intersection_min, intersection_max,
+    deps.SECTION_BOX_PADDING_FRACTION, deps)`` - the same padding helper and
+    constant ticket 1018 already used, just around a different, tighter
+    source box now (ticket instruction #3, explicit: "does NOT need
+    `_combined_host_space_bounding_box` at all anymore for this purpose").
+    `_combined_host_space_bounding_box` itself is UNTOUCHED and still used
+    exactly as before for camera fly-to (T-4) - not called from here at all
+    anymore.
 
-    VIEW-TYPE GUARD (ticket instruction #4) - MIRRORS
+    MISSING-INTERSECTION-DATA GUARD (ticket instruction #3, explicit): a
+    ``ClashResult`` can have ``intersection_min``/``intersection_max`` both
+    ``None`` - either an older result that predates this capture, or a
+    genuine (if narrow) case where `solids_clash` confirmed a real clash but
+    `_outline_for_solid` itself couldn't produce a box for the intersection
+    solid (see that function's own docstring). Handled the SAME way this
+    function already handles "no bounding box available" (a console note via
+    ``output.print_md``, return ``False``, no Transaction opened) - not a
+    new, different failure mode.
+
+    VIEW-TYPE GUARD (unchanged from ticket 1018) - MIRRORS
     ``reframe_active_view_on_clash``'s OWN ``isinstance(active_view,
     deps.View3D)`` GUARD EXACTLY, not a newly invented one: ``SetSectionBox``/
-    ``IsSectionBoxActive`` are View3D-only members (unlike
-    ``IsolateElementsTemporary``, a plain ``View`` method that works on any
-    view type, which is why host isolate itself needs no such guard). If
-    `view` isn't a ``View3D``, this is a soft no-op - a console note via
-    ``output.print_md`` (never a blocking ``forms.alert``, matching camera
-    fly-to's own "this fires on every navigation step" posture) and a
-    ``False`` return - so host-side Temporary Isolate keeps working exactly
-    as it does today; the whole Isolate toggle is never failed or blocked
-    over this (ticket instruction #4, explicit).
+    ``IsSectionBoxActive`` are View3D-only members. If `view` isn't a
+    ``View3D``, this is a soft no-op - a console note via
+    ``output.print_md`` (never a blocking ``forms.alert``) and a ``False``
+    return - the caller decides what else that does or doesn't block (as of
+    this ticket, the caller is the independent Section Box checkbox, not
+    Isolate - see `ClashListWindow.section_box_checkbox_checked` below).
 
-    Like ``reframe_active_view_on_clash``/``select_clash_pair``, this
-    function never raises for a "nothing to show" condition (not a View3D; no
-    bounding box available for one or both elements; the link could no
-    longer be resolved) - each is reported via ``output.print_md`` and
-    returns ``False``. It DOES let a real Transaction/API failure inside the
-    actual ``SetSectionBox``/``IsSectionBoxActive`` call propagate uncaught
-    (after rolling back), exactly like ``_isolate_host_element`` does for
-    ``IsolateElementsTemporary`` - the caller
-    (``ClashListWindow._apply_isolate_for_clash``) is responsible for
-    catching that and reporting it without undoing the host isolate that (per
-    the ticket) already succeeded by the time this is called.
+    This function never raises for a "nothing to show" condition (not a
+    View3D; no intersection box available) - each is reported via
+    ``output.print_md`` and returns ``False``. It DOES let a real
+    Transaction/API failure inside the actual ``SetSectionBox``/
+    ``IsSectionBoxActive`` call propagate uncaught (after rolling back) -
+    the caller is responsible for catching and reporting that.
 
     Returns ``True`` if the section box was applied, ``False`` if it was
     skipped or could not be computed.
 
     Only ever runs from inside ``_RevitApiBridge.Execute()`` (via
-    ``ClashListWindow._apply_isolate_for_clash``'s queued ``_apply``
-    closure), where bare module-level name lookups are broken (see the
-    "HELPER DEPS CONTAINER" section below this one) - `deps` replaces every
-    bare `View3D`/`BoundingBoxXYZ`/`Transaction`/`output`/`ClashFlagError`/
-    `_combined_host_space_bounding_box`/`_pad_bounding_box`/
-    `SECTION_BOX_PADDING_FRACTION` reference below.
+    ``ClashListWindow._apply_section_box_for_clash_toggle``'s queued
+    ``_apply`` closure), where bare module-level name lookups are broken (see
+    the "HELPER DEPS CONTAINER" section below this one) - `deps` replaces
+    every bare `View3D`/`BoundingBoxXYZ`/`Transaction`/`output`/
+    `_pad_bounding_box`/`SECTION_BOX_PADDING_FRACTION` reference below.
     """
     if not isinstance(view, deps.View3D):
         deps.output.print_md(
             "_ClashFlag: active view is not a 3D view - skipping the "
-            "Isolate section box for this clash (host isolate is still "
-            "applied). Switch to a 3D view to also crop the linked model._"
+            "Section Box for this clash. Switch to a 3D view to crop it._"
         )
         return False
 
-    try:
-        combined_box = deps._combined_host_space_bounding_box(
-            clash_result, host_doc, view, deps
-        )
-    except deps.ClashFlagError as combine_error:
+    intersection_min = getattr(clash_result, "intersection_min", None)
+    intersection_max = getattr(clash_result, "intersection_max", None)
+    if intersection_min is None or intersection_max is None:
         deps.output.print_md(
-            "_ClashFlag: could not compute the Isolate section box: "
-            "{0}_".format(combine_error)
-        )
-        return False
-
-    if combined_box is None:
-        deps.output.print_md(
-            "_ClashFlag: could not read a bounding box for one or both "
-            "elements in this clash - skipping the Isolate section box._"
+            "_ClashFlag: no intersection geometry was captured for this "
+            "clash - skipping the Section Box._"
         )
         return False
 
     padded_min, padded_max = deps._pad_bounding_box(
-        combined_box[0], combined_box[1], deps.SECTION_BOX_PADDING_FRACTION, deps
+        intersection_min, intersection_max, deps.SECTION_BOX_PADDING_FRACTION, deps
     )
 
     section_box = deps.BoundingBoxXYZ()
     section_box.Min = padded_min
     section_box.Max = padded_max
 
-    transaction = deps.Transaction(host_doc, "ClashFlag: isolate section box")
+    transaction = deps.Transaction(host_doc, "ClashFlag: section box")
     transaction.Start()
     try:
         view.IsSectionBoxActive = True
@@ -2618,30 +2693,30 @@ def _apply_section_box_for_clash(host_doc, view, clash_result, deps):
 
 
 def _clear_section_box(host_doc, view, deps):
-    """Turn `view`'s Section Box OFF - the link-side counterpart to
-    ``_exit_temporary_isolate``'s host-side clear, called from the exact same
-    clear paths (``isolate_checkbox_unchecked`` and ``show_clash_list``'s
-    Closed handler), against the SAME view host isolate already targets this
-    session (``ClashListWindow.isolate_view_id``) - never a separately
-    tracked view.
+    """Turn `view`'s Section Box OFF - the clear half of the independent
+    Section Box toggle (T-19), called from `ClashListWindow.
+    _clear_section_box_if_active` (`section_box_checkbox_unchecked` and
+    `show_clash_list`'s Closed handler), against the SAME view
+    `self.section_box_view_id` captured this session - unchanged in
+    substance from ticket 1018's version of this function, only its callers
+    (and their session-view state) changed.
 
-    VIEW-TYPE GUARD: `view` might not be a ``View3D`` (host isolate itself
-    works on any view type, so the session's captured view is not guaranteed
-    to be one) - ``IsSectionBoxActive``/``SetSectionBox`` are View3D-only
-    members, so this is a no-op (no Transaction opened, no attribute-error
-    risk) for a non-``View3D`` view, mirroring
-    ``_apply_section_box_for_clash``'s own guard for the same reason.
+    VIEW-TYPE GUARD: `view` might not be a ``View3D`` -
+    ``IsSectionBoxActive``/``SetSectionBox`` are View3D-only members, so this
+    is a no-op (no Transaction opened, no attribute-error risk) for a
+    non-``View3D`` view, mirroring `_apply_section_box_for_clash`'s own guard
+    for the same reason - and checked BEFORE ever touching
+    ``IsSectionBoxActive``, not after, so a non-View3D captured view can
+    never raise an ``AttributeError`` here.
 
-    Also guards with ``view.IsSectionBoxActive`` itself, mirroring
-    ``_exit_temporary_isolate``'s own ``IsInTemporaryViewMode`` guard - a true
-    no-op (no Transaction opened) if the section box was never turned on for
-    this view this session (e.g. every apply so far skipped it because the
-    active view wasn't a View3D at apply time), or was already turned off by
-    some other means (e.g. the user manually cleared it via Revit's own
-    Section Box UI while ClashFlag's checkbox was still checked).
+    Also guards with ``view.IsSectionBoxActive`` itself - a true no-op (no
+    Transaction opened) if the section box was never turned on for this view
+    this session, or was already turned off by some other means (e.g. the
+    user manually cleared it via Revit's own Section Box UI while
+    ClashFlag's checkbox was still checked).
 
     Only ever runs from inside ``_RevitApiBridge.Execute()`` (via
-    ``ClashListWindow._clear_isolate_if_active``'s queued ``_clear``
+    ``ClashListWindow._clear_section_box_if_active``'s queued ``_clear``
     closure), where bare module-level name lookups are broken - `deps`
     replaces the bare `View3D`/`Transaction` references below.
     """
@@ -2649,7 +2724,7 @@ def _clear_section_box(host_doc, view, deps):
         return
     if not view.IsSectionBoxActive:
         return
-    transaction = deps.Transaction(host_doc, "ClashFlag: clear isolate section box")
+    transaction = deps.Transaction(host_doc, "ClashFlag: clear section box")
     transaction.Start()
     try:
         view.IsSectionBoxActive = False
@@ -2987,6 +3062,23 @@ class ClashListWindow(forms.WPFWindow):
         self.isolate_active = False
         self.isolate_view_id = None
 
+        # T-19 (ticket 1019, US-9) state - the independent Section Box
+        # toggle. Mirrors `isolate_active`/`isolate_view_id`'s EXACT shape
+        # and "capture once per session, never re-read doc.ActiveView on
+        # re-apply" reasoning (see the comment above and
+        # `_apply_isolate_for_clash`'s own docstring) - `section_box_view_id`
+        # is captured ONCE at the first Checked of a session and reused by
+        # id for every later re-apply, all the way through to
+        # Unchecked/Closed, for the identical "don't strand an earlier
+        # cropped view with nothing left able to clear it" reason. Fully
+        # independent of `isolate_active`/`isolate_view_id` and
+        # `colorize_active`/`colorize_view_id` - this state is never read or
+        # written by any Isolate or Colorize code, and vice versa (ticket
+        # 1019 reverses ticket 1018's bundling of the section box into
+        # Isolate's own state).
+        self.section_box_active = False
+        self.section_box_view_id = None
+
         # T-11 (ticket 1011) fix: every module-level name a delegate-wired
         # (XAML Checked=/Unchecked=/Click=) method on this class needs is
         # captured as a `self.*` attribute HERE, in __init__ - the one method
@@ -3013,10 +3105,14 @@ class ClashListWindow(forms.WPFWindow):
         self._isolate_host_element_fn = _isolate_host_element
         self._exit_temporary_isolate_fn = _exit_temporary_isolate
         self._select_clash_pair_fn = select_clash_pair
-        # T-18 (ticket 1018): the link-side "isolate via section box" half of
-        # US-7, captured the same way as every other `self._xxx_fn` entry
-        # point above - see this module's "ISOLATE LINK VIA SECTION BOX"
-        # section for what each does.
+        # T-19 (ticket 1019, US-9): the now-INDEPENDENT Section Box toggle's
+        # two Transaction-wrapped helpers, captured the same way as every
+        # other `self._xxx_fn` entry point above - see this module's
+        # "SECTION BOX FOCUSED ON THE CLASH" section for what each does. NO
+        # LONGER called from `_apply_isolate_for_clash`/`_clear_isolate_if_
+        # active` (that was ticket 1018's now-reverted bundling) - only from
+        # this checkbox's own `_apply_section_box_for_clash_toggle`/`_clear_
+        # section_box_if_active` methods below.
         self._apply_section_box_for_clash_fn = _apply_section_box_for_clash
         self._clear_section_box_fn = _clear_section_box
         # T-12 (ticket 1012) fix: `apply_colorize_overrides`/
@@ -3048,10 +3144,12 @@ class ClashListWindow(forms.WPFWindow):
             self._set_current_index(0)
         else:
             self._update_status_and_buttons()
-            # Nothing to colorize or isolate either - matches the disabled
-            # Previous/Next buttons' "no clashes" treatment above.
+            # Nothing to colorize, isolate, or section-box either - matches
+            # the disabled Previous/Next buttons' "no clashes" treatment
+            # above.
             self.ColorizeCheckBox.IsEnabled = False
             self.IsolateCheckBox.IsEnabled = False
+            self.SectionBoxCheckBox.IsEnabled = False
 
     def colorize_checkbox_checked(self, sender, args):
         """Turn colorize-by-category ON for the WHOLE current
@@ -3201,10 +3299,22 @@ class ClashListWindow(forms.WPFWindow):
         bridge.raise_action(_clear)
 
     def isolate_checkbox_checked(self, sender, args):
-        """Turn Isolate ON (US-7 / ticket 1009) for the CURRENT clash - see
-        this module's "ISOLATE CURRENT CLASH" section and
-        _apply_isolate_for_clash's own docstring for what actually happens
-        and exactly which view it targets.
+        """Turn Isolate ON (US-7 / ticket 1009, HOST-ONLY SCOPE RESTORED BY
+        TICKET 1019) for the CURRENT clash - see this module's "ISOLATE
+        CURRENT CLASH" section and _apply_isolate_for_clash's own docstring
+        for what actually happens and exactly which view it targets.
+
+        T-19 (ticket 1019) REVERT: ticket 1018 briefly bundled a link-side
+        Section Box into this same checkbox (see this module's "SECTION BOX
+        FOCUSED ON THE CLASH" header comment) - that bundling is now
+        completely removed. This method, `isolate_checkbox_unchecked`,
+        `_apply_isolate_for_clash`, and `_clear_isolate_if_active` are back
+        to doing EXACTLY what they did before ticket 1018 ever touched them:
+        host isolate + Select, nothing else. The Section Box now lives
+        entirely in its own `SectionBoxCheckBox`/`section_box_checkbox_
+        checked`/`_unchecked` below, with its own independent state
+        (`self.section_box_active`/`self.section_box_view_id`) - this method
+        never reads or writes any of that.
 
         Like every other ClashListWindow handler, this runs OUTSIDE a valid
         Revit API execution context (see the module docstring's "SECOND
@@ -3289,19 +3399,13 @@ class ClashListWindow(forms.WPFWindow):
         docstring note) - threaded through the same way as every other
         `self.*` capture here.
 
-        T-18 (ticket 1018) addition: alongside the unchanged host-side
-        `isolate_host_element_fn` call and `select_clash_pair_fn` call below,
-        this now ALSO calls `section_box_fn` (`_apply_section_box_for_clash`)
-        on the exact same session view, applying/replacing the link-side
-        Section Box for the newly-current clash on every apply and re-apply -
-        reusing `isolate_view_id`'s existing session-scoped-view capture
-        above rather than adding a second "which view" tracking mechanism
-        (per the ticket's explicit instruction). Only called AFTER
-        `isolate_host_element_fn` succeeds, and its own failure (including
-        the soft "not a View3D" case, reported by `section_box_fn` itself via
-        `output.print_md`) never undoes the host isolate that already
-        succeeded, or blocks the rest of this apply (select, the "Isolate is
-        ON" note) - ticket instruction #4, explicit.
+        T-19 (ticket 1019) REVERT: ticket 1018 added a `section_box_fn` call
+        alongside `isolate_host_element_fn` here. That call is REMOVED - this
+        method is back to doing exactly what it did before 1018 (host
+        isolate + Select), per hard requirement #1. See `SectionBoxCheckBox`
+        /`section_box_checkbox_checked`/`_apply_section_box_for_clash_toggle`
+        below for where that responsibility now lives, completely
+        independently of this method.
         """
         if clash_result is None:
             return
@@ -3311,7 +3415,6 @@ class ClashListWindow(forms.WPFWindow):
         print_output = self._output
         isolate_host_element_fn = self._isolate_host_element_fn
         select_clash_pair_fn = self._select_clash_pair_fn
-        section_box_fn = self._apply_section_box_for_clash_fn
         bridge = self._bridge
         deps = self._helper_deps
 
@@ -3359,23 +3462,6 @@ class ClashListWindow(forms.WPFWindow):
             self.isolate_active = True
             self.isolate_view_id = view.Id
 
-            # T-18 (ticket 1018): crop `view`'s Section Box to the combined
-            # host+link bounding box of this clash - the link-side isolation
-            # half of US-7, alongside the host isolate that just succeeded
-            # above. Never allowed to undo the host isolate or block the
-            # rest of this apply (select, the "Isolate is ON" note) - a
-            # failure here (including the soft "not a View3D" skip, which
-            # `section_box_fn` itself reports via `output.print_md` and
-            # signals by returning False, not by raising) is caught and
-            # reported on its own, separately from everything else.
-            try:
-                section_box_fn(host_doc, view, clash_result, deps)
-            except Exception as section_box_error:
-                print_output.print_md(
-                    "_ClashFlag: could not apply the Isolate section box: "
-                    "{0}_".format(section_box_error)
-                )
-
             # Always also Select both elements (US-7) - the link-side
             # element can't be isolated (same API ceiling as colorize's
             # host-only override limitation), so Select keeps it findable
@@ -3392,17 +3478,15 @@ class ClashListWindow(forms.WPFWindow):
                 # out the genuinely useful per-step failure notes above.
                 print_output.print_md(
                     "_ClashFlag: Isolate is ON - hides everything in this "
-                    "view except this clash's host-side element, AND (T-18) "
-                    "crops a Section Box around both this clash's elements "
-                    "so the linked model is cut down to the immediate clash "
-                    "region too (region-based, not by element identity - a "
-                    "different nearby element can still be visible; see "
-                    "specs/clash-flag.md's US-7). The link-side element "
-                    "itself still can't be isolated directly (same Revit "
-                    "API ceiling as colorize's host-only limitation), so "
-                    "Select also keeps it findable. Moving to a different "
-                    "clash replaces both the isolation and the section box; "
-                    "turning Isolate off restores full visibility._"
+                    "view except this clash's host-side element. The "
+                    "link-side element itself still can't be isolated "
+                    "directly (same Revit API ceiling as colorize's "
+                    "host-only limitation), so Select also keeps it "
+                    "findable. Moving to a different clash replaces the "
+                    "isolation; turning Isolate off restores full "
+                    "visibility. (Use the separate Section Box toggle for a "
+                    "tight crop around the actual clash region in both "
+                    "models.)_"
                 )
 
         bridge.raise_action(_apply)
@@ -3439,13 +3523,12 @@ class ClashListWindow(forms.WPFWindow):
         function's own T-12 docstring note) - threaded through the same way
         as every other `self.*` capture here.
 
-        T-18 (ticket 1018) addition: alongside the unchanged
-        `exit_temporary_isolate_fn` call below, this now ALSO calls
-        `clear_section_box_fn` (`_clear_section_box`) on the exact same
-        session view, turning the link-side Section Box off - the other
-        half of "turning Isolate off ... immediately restores the full
-        view" (US-7), independent of the host-side clear above: a failure
-        in one is reported and does not prevent the other from running.
+        T-19 (ticket 1019) REVERT: ticket 1018 added a `clear_section_box_fn`
+        call alongside `exit_temporary_isolate_fn` here. That call is
+        REMOVED - this method is back to doing exactly what it did before
+        1018 (exit Temporary Isolate mode only), per hard requirement #1.
+        See `_clear_section_box_if_active` below for where that
+        responsibility now lives, completely independently of this method.
         """
         if not self.isolate_active:
             return
@@ -3453,7 +3536,6 @@ class ClashListWindow(forms.WPFWindow):
         host_doc = self._doc
         print_output = self._output
         exit_temporary_isolate_fn = self._exit_temporary_isolate_fn
-        clear_section_box_fn = self._clear_section_box_fn
         bridge = self._bridge
         deps = self._helper_deps
 
@@ -3466,9 +3548,9 @@ class ClashListWindow(forms.WPFWindow):
             if view is None:
                 print_output.print_md(
                     "_ClashFlag: the view Isolate was applied to no longer "
-                    "exists - its Temporary Isolate mode and Isolate "
-                    "section box could not be explicitly cleared (they "
-                    "went away with the view itself)._"
+                    "exists - its Temporary Isolate mode could not be "
+                    "explicitly cleared (it went away with the view "
+                    "itself)._"
                 )
                 return
             try:
@@ -3478,15 +3560,192 @@ class ClashListWindow(forms.WPFWindow):
                     "_ClashFlag: failed to fully exit Temporary Isolate "
                     "mode: {0}_".format(clear_error)
                 )
-            # T-18: independent of the host-isolate clear above - a failure
-            # in either must not prevent the other from running, same
-            # posture as the apply-side pairing in _apply_isolate_for_clash.
+
+        bridge.raise_action(_clear)
+
+    def section_box_checkbox_checked(self, sender, args):
+        """Turn the independent Section Box toggle ON (US-9 / ticket 1019)
+        for the CURRENT clash - see this module's "SECTION BOX FOCUSED ON
+        THE CLASH" section and `_apply_section_box_for_clash`'s own
+        docstring for what actually happens.
+
+        Fully independent of Isolate/Colorize (ticket 1019 hard
+        requirement): this method only ever reads/writes
+        `self.section_box_active`/`self.section_box_view_id` - never
+        `self.isolate_active`/`self.isolate_view_id` or
+        `self.colorize_active`/`self.colorize_view_id`. Structurally mirrors
+        `isolate_checkbox_checked` (read already-held plain state, hand off
+        to a shared apply method that queues the real work through the
+        bridge) - nothing Revit-API-touching is ever called directly from
+        this method's own body.
+        """
+        clash_result = self._current_clash_result()
+        if clash_result is None:
+            # Shouldn't normally happen - SectionBoxCheckBox is disabled
+            # whenever clash_results is empty (see __init__) - guarded
+            # defensively anyway, same posture as the other two checkboxes.
+            self.SectionBoxCheckBox.IsChecked = False
+            return
+        self._apply_section_box_for_clash_toggle(clash_result)
+
+    def section_box_checkbox_unchecked(self, sender, args):
+        """Turn the Section Box OFF: clear it on whichever view it's
+        currently active on, restoring full visibility there - see
+        `_clear_section_box_if_active`'s docstring for exactly which view
+        and why."""
+        self._clear_section_box_if_active()
+
+    def _apply_section_box_for_clash_toggle(self, clash_result):
+        """Queue the bridge action that crops the Section Box to
+        `clash_result`'s actual intersection region (US-9) - shared by
+        `section_box_checkbox_checked` (the FIRST apply of a Section Box
+        "session") and `on_selection_changed` (every RE-apply triggered by
+        Next/Previous/list-click navigation while `self.section_box_active`
+        is already True). Named `_apply_section_box_for_clash_toggle`
+        (rather than `_apply_section_box_for_clash`, which is already the
+        module-level Transaction-wrapped helper this method calls) so the
+        two names don't collide - mirrors `_apply_isolate_for_clash`'s own
+        naming relationship to `_isolate_host_element`.
+
+        VIEW CHOICE - CAPTURE ONCE PER SESSION, DON'T RE-READ "WHATEVER'S
+        ACTIVE NOW" ON EVERY RE-APPLY: identical reasoning to
+        `_apply_isolate_for_clash`'s own docstring (see that method for the
+        full "stranded view" failure mode this avoids) - applied here to
+        `self.section_box_view_id` as its OWN, independent captured view,
+        never `self.isolate_view_id`. The Section Box session and the
+        Isolate session can each be on a DIFFERENT captured view if a user
+        toggles them at different times with a different active view each
+        time - this method never reads or assumes anything about Isolate's
+        own captured view.
+
+        No-ops (queues nothing) when `clash_result` is None - nothing is
+        currently "the current clash" - there is nothing to crop around.
+
+        Every module-level/bare name this method and its nested `_apply`
+        closure need is read from a `self.*` attribute captured in
+        `__init__` (T-11 pattern) - `section_box_fn` (`_apply_section_box_
+        for_clash`) itself also needs `deps` for its own bare module-level
+        references (T-12 pattern) - threaded through exactly like every
+        other `self.*` capture in this class.
+        """
+        if clash_result is None:
+            return
+
+        host_doc = self._doc
+        print_output = self._output
+        section_box_fn = self._apply_section_box_for_clash_fn
+        bridge = self._bridge
+        deps = self._helper_deps
+
+        reuse_view_id = self.section_box_view_id
+        is_first_apply_in_session = reuse_view_id is None
+
+        def _apply():
+            if reuse_view_id is not None:
+                view = host_doc.GetElement(reuse_view_id)
+                if view is None:
+                    print_output.print_md(
+                        "_ClashFlag: the view the Section Box was applied "
+                        "to no longer exists - turning Section Box off._"
+                    )
+                    self.section_box_active = False
+                    self.section_box_view_id = None
+                    self.SectionBoxCheckBox.IsChecked = False
+                    return
+            else:
+                view = host_doc.ActiveView
+
+            try:
+                applied = section_box_fn(host_doc, view, clash_result, deps)
+            except Exception as section_box_error:
+                print_output.print_md(
+                    "_ClashFlag: could not apply the Section Box: "
+                    "{0}_".format(section_box_error)
+                )
+                self.section_box_active = False
+                self.section_box_view_id = None
+                self.SectionBoxCheckBox.IsChecked = False
+                return
+
+            if not applied:
+                # A soft skip (not a View3D, or no intersection geometry
+                # captured for this clash) already reported its own reason
+                # via output.print_md inside `_apply_section_box_for_clash` -
+                # nothing further to say here, but the toggle itself stays
+                # checked (per ticket instruction #3's "does not block or
+                # fail the whole toggle" posture, mirroring how a skipped
+                # camera reframe never fails the whole navigation step) so a
+                # later re-apply (e.g. after switching to a View3D) can
+                # still succeed without the user having to re-check the box.
+                return
+
+            self.section_box_active = True
+            self.section_box_view_id = view.Id
+
+            if is_first_apply_in_session:
+                print_output.print_md(
+                    "_ClashFlag: Section Box is ON - crops the active 3D "
+                    "view tightly around this clash's actual intersection "
+                    "region, in both the host and linked model (region-"
+                    "based, not by element identity - a different, "
+                    "non-clashing element physically near the clash can "
+                    "still be visible; see specs/clash-flag.md's US-9). "
+                    "Independent of Isolate and Colorize. Moving to a "
+                    "different clash replaces the box; turning this off "
+                    "restores full visibility._"
+                )
+
+        bridge.raise_action(_apply)
+
+    def _clear_section_box_if_active(self):
+        """Shared by `section_box_checkbox_unchecked` above AND
+        `show_clash_list`'s Closed-event cleanup below - exact mirror of
+        `_clear_isolate_if_active`'s own shape and reasoning (a window
+        closed while the Section Box is still on must not leave the one
+        view it was applied to permanently cropped after this window's UI
+        is gone). No-ops if the Section Box was never turned on, or was
+        already cleared - same double-fire safety `_clear_isolate_if_active`
+        already relies on.
+
+        State reset happens SYNCHRONOUSLY, immediately, here - not deferred
+        into the queued bridge closure - same reasoning as
+        `_clear_isolate_if_active`'s own docstring.
+
+        Fully independent of Isolate/Colorize (ticket 1019 hard
+        requirement): only ever reads/writes `self.section_box_active`/
+        `self.section_box_view_id` - never touches `self.isolate_active`/
+        `self.isolate_view_id` or `self.colorize_active`/
+        `self.colorize_view_id`, and clears `self.section_box_view_id`
+        (its OWN captured view), never `self.isolate_view_id`.
+        """
+        if not self.section_box_active:
+            return
+
+        host_doc = self._doc
+        print_output = self._output
+        clear_section_box_fn = self._clear_section_box_fn
+        bridge = self._bridge
+        deps = self._helper_deps
+
+        view_id = self.section_box_view_id
+        self.section_box_active = False
+        self.section_box_view_id = None
+
+        def _clear():
+            view = host_doc.GetElement(view_id) if view_id else None
+            if view is None:
+                print_output.print_md(
+                    "_ClashFlag: the view the Section Box was applied to no "
+                    "longer exists - it could not be explicitly cleared (it "
+                    "went away with the view itself)._"
+                )
+                return
             try:
                 clear_section_box_fn(host_doc, view, deps)
-            except Exception as section_clear_error:
+            except Exception as clear_error:
                 print_output.print_md(
-                    "_ClashFlag: failed to fully clear the Isolate section "
-                    "box: {0}_".format(section_clear_error)
+                    "_ClashFlag: failed to fully clear the Section Box: "
+                    "{0}_".format(clear_error)
                 )
 
         bridge.raise_action(_clear)
@@ -3560,12 +3819,24 @@ class ClashListWindow(forms.WPFWindow):
         window-open (that initial call is harmless here since
         `self.isolate_active` is always still False at that point - Isolate
         is opt-in and can't have been checked before the window finished
-        constructing)."""
+        constructing).
+
+        T-19 / ticket 1019 (US-9) ALSO hooks in here, for the exact same
+        reason and via the exact same shared hook - the ticket's explicit
+        instruction is to reuse this one navigation hook rather than invent
+        a second - independently of the Isolate branch just above: if the
+        Section Box toggle is currently on, replace the box for the
+        newly-current clash. Each branch only ever reads/acts on its own
+        `*_active` flag - neither branch reads or is gated by the other's.
+        """
         if self.selection_changed_callback is not None:
             self.selection_changed_callback(clash_result, index)
 
         if self.isolate_active:
             self._apply_isolate_for_clash(clash_result)
+
+        if self.section_box_active:
+            self._apply_section_box_for_clash_toggle(clash_result)
 
     def next_button_click(self, sender, args):
         self._set_current_index(self.current_index + 1)
@@ -3615,6 +3886,12 @@ def show_clash_list(clash_results, selection_changed_callback=None):
         # isolate_checkbox_unchecked uses. Independent of the colorize call
         # above - neither reads or writes the other's state.
         window._clear_isolate_if_active()
+        # T-19 / ticket 1019 instruction: same treatment again for the
+        # independent Section Box toggle - don't leave the model's view
+        # stuck cropped after this window's UI is gone, using the exact same
+        # restore path section_box_checkbox_unchecked uses. Independent of
+        # both calls above - reads/writes only its own state.
+        window._clear_section_box_if_active()
         if window in _open_clash_list_windows:
             _open_clash_list_windows.remove(window)
 
@@ -3741,7 +4018,9 @@ def run_interference_check(scope_selection):
             )
         )
 
-        for index, (element1, element2) in enumerate(clashing_pairs, start=1):
+        for index, (element1, element2, intersection_min, intersection_max) in enumerate(
+            clashing_pairs, start=1
+        ):
             host_id_text = output.linkify(element1.Id)
 
             output.print_md(
@@ -3754,7 +4033,14 @@ def run_interference_check(scope_selection):
                 )
             )
             all_clash_results.append(
-                ClashResult(element1, element2, link_name, link_instance.Id)
+                ClashResult(
+                    element1,
+                    element2,
+                    link_name,
+                    link_instance.Id,
+                    intersection_min,
+                    intersection_max,
+                )
             )
 
     output.print_md("---")

@@ -65,6 +65,30 @@ element via unchanged host-side Temporary Isolate, plus a section box (reusing t
 existing camera-fly-to bounding-box math from ticket 1004) that crops everything else,
 in both models, to the immediate clash region.
 
+## Amendment (2026-09-07, round 2): Section Box split out, sized to the actual clash
+
+Source: live-testing feedback (ticket 1019), reopening ticket 1018's bundled-into-Isolate
+Section Box after real use surfaced two problems at once:
+1. **Wrong box size.** 1018 sized the section box to the combined bounding box of the two
+   FULL clashing elements (reusing camera fly-to's math as-is). When one element is much
+   larger than the other — the motivating case: a large host floor slab clashing with a
+   small linked pipe — that combined box is roughly the size of the large element, and
+   barely crops anything. **Fixed** by sizing the box from the actual intersection
+   geometry instead: the detection engine already computes the exact overlap solid
+   between the two elements to confirm a clash at all (`solids_clash`) — that solid's own
+   (small, by construction) bounding box is now captured onto `ClashResult` at detection
+   time instead of being discarded, and used for the section box padding math instead of
+   the two full elements' extents.
+2. **Wrong control.** Bundling the section box into the "Isolate" checkbox meant a user
+   couldn't get the tight focus box without also hiding other host elements. **Fixed** by
+   splitting Section Box out into its own independent checkbox (US-9 below) — Isolate
+   reverts to exactly its original ticket-1009 scope (host-side only).
+
+Also folded into this round: **element IDs shown in the clash list** (US-3 revised) — a
+real, separately-surfaced need (referencing a specific pipe precisely, e.g. for a
+builder) that has nothing to do with the section box mechanism but was raised in the same
+conversation and is a small, low-risk addition.
+
 ## Locked decisions carried in from Wayfinder
 - Detection: manual transform pipeline (0002, revised after Phase 7 review of ticket
   1001 found the native cross-document check couldn't be verified to apply the
@@ -86,8 +110,8 @@ As a BIM engineer, I want to pick which categories and which loaded linked model
 **US-2 — Fast, reliable detection**
 As a BIM engineer, I want clash detection across the host model and my selected links to be geometrically correct — explicitly accounting for each link's placement transform — so that I don't get missed or phantom clashes because of how a link happens to be positioned. (Revised after Phase 7 review: uses a bbox pre-filter + explicit link-transform + solid intersection pipeline for the cross-document case, rather than trusting the native check to handle link transforms automatically.)
 
-**US-3 — Navigable clash list**
-As a BIM engineer, I want all detected clashes to appear in a list I can step through one at a time (next/previous), so that I can review every clash methodically without losing track of where I am.
+**US-3 — Navigable clash list (revised 2026-09-07, round 2)**
+As a BIM engineer, I want all detected clashes to appear in a list I can step through one at a time (next/previous), so that I can review every clash methodically without losing track of where I am. Each row shows both elements' Revit Element IDs alongside their category/type description, so I can reference a specific clashing element precisely (e.g. telling a builder exactly which pipe to move) without switching to Revit's own Element ID lookup.
 
 **US-4 — Camera auto-navigation**
 As a BIM engineer, I want the 3D view to automatically reframe on the two clashing elements when I select a clash from the list, so that I don't have to manually hunt for and zoom to each clash location.
@@ -98,13 +122,16 @@ As a BIM engineer, I want an option to color-code the host-side clashing element
 **US-6 — Fits existing workflow**
 As a BIM engineer, I want ClashFlag delivered as a pyRevit pushbutton, so that it installs and runs the same way as the rest of my pyRevit toolkit, with no separate compiled add-in to deploy.
 
-**US-7 — Isolate the current clash, both host and linked model** *(added 2026-09-04, revised 2026-09-07, mechanism revised again 2026-09-07)*
-As a BIM engineer, I want an opt-in "Isolate" toggle that, while on, focuses the view tightly on the current clash — the host element fully isolated, and everything else nearby cropped away in both the host and linked model — so that I can pinpoint the specific clashing element (e.g. the one pipe out of many) without visual clutter from the rest of either model. This is close parity with how Navisworks' own clash isolate behaves, with one accepted difference: precision is by 3D region, not by element identity, so a different, non-clashing element that happens to sit right next to the clash can still be visible. Host-side isolation is unchanged from before (Revit's native Temporary Isolate mode, `View.IsolateElementsTemporary`); link-side focus uses a Section Box (`View3D.SetSectionBox`), tightly padded around the combined bounding box of both clashing elements (reusing the exact bounding-box math ticket 1004's camera fly-to already established) — this crops geometry uniformly across host and link at the view level, requires only a `View3D` active view (same constraint camera fly-to already has; skipped with a console note otherwise), and needs no per-element identification of "everything else in the link" at all. Moving to a different clash while Isolate is on replaces both the host isolation and the section box (never accumulates). Select still always runs alongside Isolate, matching prior behavior exactly. Turning Isolate off, or closing the clash list window while it's on, immediately restores the full view on both sides (`IsSectionBoxActive = False` alongside exiting Temporary Isolate mode). Independent of Colorize (US-5).
+**US-7 — Isolate the current clash (host-side)** *(added 2026-09-04, reverted to host-only scope 2026-09-07 round 2)*
+As a BIM engineer, I want an opt-in "Isolate" toggle that, while on, hides everything in the view except the current clash's host-side element and highlights (selects) both the host and link elements of that clash, so that I can focus on the host element without visual clutter from the rest of the host model. This is exactly ticket 1009's original scope — a brief attempt to also fold link-side focus into this same checkbox (tickets 1017, 1018) was tried and reverted; link-side focus is now US-9's separate Section Box, not part of Isolate. Moving to a different clash while Isolate is on replaces the isolation (never accumulates). Select always runs alongside Isolate, since the link-side element can't itself be isolated. Turning Isolate off, or closing the clash list window while it's on, immediately restores the full host view. Independent of Colorize (US-5) and Section Box (US-9).
 
 **US-8 — Legend for the color mapping** *(added 2026-09-04)*
 As a BIM engineer, I want a color swatch shown next to each entry in the clash list, so that I can see what each color means right where I'm using it, without a separate lookup.
 
+**US-9 — Section Box focused on the actual clash, both host and linked model** *(added 2026-09-07, round 2)*
+As a BIM engineer, I want an opt-in "Section Box" toggle, independent of Isolate, that while on crops the active 3D view tightly around the current clash's actual intersection point — not the two full clashing elements — hiding everything else nearby in both the host and linked model, so that I can pinpoint the specific clashing element (e.g. the one pipe out of many, next to a large floor slab) regardless of how large either element is. Sized from the real intersection geometry the detection engine already computes to confirm the clash (`solids_clash`'s boolean intersection result, captured onto `ClashResult` rather than discarded), not the two elements' full extents — this is the fix for 1018's attempt, which sized the box to both full elements and barely cropped anything when one dwarfed the other. Crops geometry uniformly across host and every linked model at the view-rendering level (`View3D.SetSectionBox`), with no per-element identification needed. Only works on a `View3D`; skipped with a console note otherwise. Moving to a different clash while it's on replaces the box (never accumulates). Turning it off, or closing the clash list window while it's on, immediately restores full visibility. Independent of Isolate (US-7) and Colorize (US-5) — any combination can be on. **Known, accepted trade-off**: crops by 3D region, not element identity, so a different, non-clashing element physically near the clash can still be visible.
+
 ## Explicitly out of scope for v1
 - Tolerance / near-miss (soft) clash detection — only hard clashes via the native check.
 - Export to Excel/CSV or integration into the Revit Warning Analysis System — the chosen UI is interactive-in-Revit, not report-based. Can be a follow-up ticket later if wanted.
-- Performance tuning/spatial partitioning — deferred per US context above; native API assumed fast enough until proven otherwise on a real model. Explicitly includes US-7's link-side hide/unhide (2026-09-07): no upfront cap or optimization for "many pipes," until live testing on a real model actually shows it's needed.
+- Performance tuning/spatial partitioning — deferred per US context above; native API assumed fast enough until proven otherwise on a real model. Explicitly includes US-9's Section Box (2026-09-07): no upfront optimization until live testing on a real model shows it's needed.
