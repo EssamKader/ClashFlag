@@ -41,6 +41,30 @@ resolved) rather than a full Wayfinder round. Two concerns were raised:
    a link-side isolate, which isn't worth doing for a highlight that Select
    already provides. Added to "Explicitly out of scope" below.
 
+## Amendment (2026-09-07): Isolate now covers both host and linked elements
+
+Source: a full Wayfinder round (tickets/1014-1016), reopening the 2026-09-04 round 2
+decision that declined this. Reopened because of a real workflow: one host floor slab
+clashing against many pipes from a linked MEP model, where Select's highlight alone
+wasn't enough to pick the specific clashing pipe out of "many pipes" still fully visible
+in the view. The original decision assumed the only path to link-side isolation was
+writing into the linked file — Research (1015) found a better-scoped mechanism instead:
+there is no direct, transactable API for hiding a linked element by identity, confirmed
+via the Revit API forum. **The mechanism was revised a second time (ticket 1018,
+superseding ticket 1017) after live testing found the tool itself, not just this
+research trail, needed a course correction**: ticket 1017 built a
+`PostCommand`-and-selection-based hide/unhide sequencer that was never deployed pending
+live verification; before that verification happened, a simpler and more robust
+alternative was identified — a **Section Box** (`View3D.SetSectionBox`), which crops
+geometry uniformly across host and every linked model at the view level, with no
+per-element identification needed at all. This eliminates the entire async/selection-race
+risk ticket 1017 was built around, at the cost of precision-by-region instead of
+precision-by-identity (a non-clashing element physically near the clash can still appear
+in a tight crop). US-7 below is revised again to match: isolating a clash shows the host
+element via unchanged host-side Temporary Isolate, plus a section box (reusing the
+existing camera-fly-to bounding-box math from ticket 1004) that crops everything else,
+in both models, to the immediate clash region.
+
 ## Locked decisions carried in from Wayfinder
 - Detection: manual transform pipeline (0002, revised after Phase 7 review of ticket
   1001 found the native cross-document check couldn't be verified to apply the
@@ -74,8 +98,8 @@ As a BIM engineer, I want an option to color-code the host-side clashing element
 **US-6 — Fits existing workflow**
 As a BIM engineer, I want ClashFlag delivered as a pyRevit pushbutton, so that it installs and runs the same way as the rest of my pyRevit toolkit, with no separate compiled add-in to deploy.
 
-**US-7 — Isolate the current clash** *(added 2026-09-04)*
-As a BIM engineer, I want an opt-in "Isolate" toggle that, while on, hides everything in the view except the current clash's host-side element and highlights (selects) both the host and link elements of that clash, so that I can focus on one clash without visual clutter from the rest of the model. Moving to a different clash while Isolate is on replaces the isolation (never accumulates); the link-side element can't itself be isolated (same API ceiling as colorize), so Select always runs alongside Isolate to keep it findable. Turning Isolate off, or closing the clash list window while it's on, immediately restores the full view. Independent of Colorize (US-5).
+**US-7 — Isolate the current clash, both host and linked model** *(added 2026-09-04, revised 2026-09-07, mechanism revised again 2026-09-07)*
+As a BIM engineer, I want an opt-in "Isolate" toggle that, while on, focuses the view tightly on the current clash — the host element fully isolated, and everything else nearby cropped away in both the host and linked model — so that I can pinpoint the specific clashing element (e.g. the one pipe out of many) without visual clutter from the rest of either model. This is close parity with how Navisworks' own clash isolate behaves, with one accepted difference: precision is by 3D region, not by element identity, so a different, non-clashing element that happens to sit right next to the clash can still be visible. Host-side isolation is unchanged from before (Revit's native Temporary Isolate mode, `View.IsolateElementsTemporary`); link-side focus uses a Section Box (`View3D.SetSectionBox`), tightly padded around the combined bounding box of both clashing elements (reusing the exact bounding-box math ticket 1004's camera fly-to already established) — this crops geometry uniformly across host and link at the view level, requires only a `View3D` active view (same constraint camera fly-to already has; skipped with a console note otherwise), and needs no per-element identification of "everything else in the link" at all. Moving to a different clash while Isolate is on replaces both the host isolation and the section box (never accumulates). Select still always runs alongside Isolate, matching prior behavior exactly. Turning Isolate off, or closing the clash list window while it's on, immediately restores the full view on both sides (`IsSectionBoxActive = False` alongside exiting Temporary Isolate mode). Independent of Colorize (US-5).
 
 **US-8 — Legend for the color mapping** *(added 2026-09-04)*
 As a BIM engineer, I want a color swatch shown next to each entry in the clash list, so that I can see what each color means right where I'm using it, without a separate lookup.
@@ -83,5 +107,4 @@ As a BIM engineer, I want a color swatch shown next to each entry in the clash l
 ## Explicitly out of scope for v1
 - Tolerance / near-miss (soft) clash detection — only hard clashes via the native check.
 - Export to Excel/CSV or integration into the Revit Warning Analysis System — the chosen UI is interactive-in-Revit, not report-based. Can be a follow-up ticket later if wanted.
-- Performance tuning/spatial partitioning — deferred per US context above; native API assumed fast enough until proven otherwise on a real model.
-- Isolating (or otherwise visually distinguishing beyond Select's existing highlight) the link-side element of a clash — evaluated 2026-09-04 and explicitly declined; Select already highlights it, and the only path to more than that would mean writing into the linked file to fake a link-side isolate.
+- Performance tuning/spatial partitioning — deferred per US context above; native API assumed fast enough until proven otherwise on a real model. Explicitly includes US-7's link-side hide/unhide (2026-09-07): no upfront cap or optimization for "many pipes," until live testing on a real model actually shows it's needed.

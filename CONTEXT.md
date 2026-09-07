@@ -12,21 +12,44 @@ element, since Revit's selection API supports cross-document references.
 _Avoid_: Isolate, highlight, focus
 
 **Isolate**:
-Temporarily hiding every element in the view except one clash's elements
-(Revit's native Temporary Isolate mode). Host-side only — Revit's API has no
-way to isolate an element that lives inside a linked document alongside host
-elements in the same operation, unlike Select. An opt-in toggle, not
+Temporarily hiding every element in the view except one clash's two
+elements — both the host-side AND the link-side element, full parity with
+Navisworks' own clash-isolate behavior (revised 2026-09-07; previously
+host-side only). Host-side isolation uses Revit's native Temporary Isolate mode
+(`View.IsolateElementsTemporary`), unchanged since ticket 1009. Link-side
+isolation (revised again, ticket 1018, superseding an abandoned
+`PostCommand`-based approach from ticket 1017 — see that ticket's own
+"Superseded" note for why) uses a **Section Box**
+(`View3D.SetSectionBox`/`IsSectionBoxActive`): a 3D region, tightly padded
+around the combined bounding box of both clashing elements, that crops
+geometry uniformly across the host document AND every linked model at the
+view-rendering level, with no awareness of document boundaries at all — so
+every other pipe/element outside that region simply doesn't render, without
+ClashFlag ever needing to identify or hide link elements one by one. This
+reuses the exact `_combined_host_space_bounding_box`/`_pad_bounding_box`
+math already built for camera fly-to (ticket 1004), and — unlike the
+abandoned approach — is a normal synchronous, `Transaction`-wrapped API
+call, the same shape as every other feature in this tool. **Known,
+accepted trade-off**: a section box crops by 3D region, not by element
+identity — a different, non-clashing element that happens to sit physically
+close to the clash (e.g. a parallel pipe in the same MEP corridor) can still
+appear inside the box. Only works on a `View3D`; if the active view isn't
+one, link-side isolation is skipped with a console note (host isolation
+still applies) — see US-7's "not a 3D view" handling, same posture camera
+fly-to already has. An opt-in toggle, not
 ClashFlag's default behavior. Stepping to a different clash while Isolate is
-on *replaces* the isolation (only the new clash's host element is shown) —
-it never accumulates a working set across clashes. Independent of Colorize:
-turning Isolate on never forces the isolated element into its category-pair
-color, and turning Colorize on never isolates anything — a user can toggle
-either, both, or neither. Because the link-side element can't be isolated,
-turning Isolate on always also Selects both elements of the current clash —
-this keeps the link-side element findable inside the still-fully-visible
-link model. Turning Isolate off, or closing the clash-list window while it's
-on, immediately exits Temporary Isolate mode and restores the full view
-(same lifecycle as Colorize's clear-on-uncheck/close).
+on *replaces* the isolation on both sides (never accumulates a working set
+across clashes). Independent of Colorize: turning Isolate on never forces
+the isolated element into its category-pair color, and turning Colorize on
+never isolates anything — a user can toggle either, both, or neither.
+Turning Isolate on still always also Selects both elements of the current
+clash, unchanged from before — no longer load-bearing for "findability"
+now that the link element is genuinely visible on its own, but kept as
+matching, deliberately-unchanged host-side behavior per the 2026-09-07
+Wayfinder round's explicit choice not to touch it. Turning Isolate off, or
+closing the clash-list window while it's on, immediately exits Temporary
+Isolate mode on the host AND restores every hidden link element (same
+lifecycle as Colorize's clear-on-uncheck/close).
 _Avoid_: Select, highlight, focus
 
 **Category Pair**:
@@ -42,7 +65,11 @@ early implementation bug, not the intended concept.
 An opt-in toggle that overrides the HOST-side element of every clash in the
 current result set with a color keyed by its Category Pair, so clash types
 are visible at a glance across the whole model. Link-side elements are never
-recolored (same Revit API limitation as Isolate). Colors are assigned by hashing the Category Pair's name directly into a hue
+recolored — Revit's API and native UI have no mechanism to override an
+individual linked element's *graphics* from the host view (unlike hiding
+one, which Isolate now uses — a graphic-override limitation and a
+visibility limitation are different capability ceilings, and only the
+latter has a workaround). Colors are assigned by hashing the Category Pair's name directly into a hue
 (fixed saturation/lightness tuned for visibility against a typical Revit
 view) rather than cycling a small fixed palette — no saved/editable table,
 no setup, and no collision as the model grows — so the same pair renders the
