@@ -5,6 +5,33 @@ A version number here is a **deploy gate**: it marks a point that's been reviewe
 and verified, not just merged. See `tickets/` for the full paper trail behind
 every line below.
 
+## [v0.6.0] - 2026-09-07
+
+### Added
+- **Section Box** — a new, independent toggle that crops the active 3D view tightly
+  around a clash's actual intersection geometry, across both the host model and every
+  linked model, regardless of how large either clashing element is (e.g. a small pipe
+  clashing a large floor slab). Sized from the real overlap solid the detection engine
+  already computes to confirm the clash, not the two elements' full extents — an earlier
+  attempt at this (bundled into the Isolate toggle) was reverted after live testing found
+  it barely cropped anything when one element dwarfed the other (tickets 1018, 1019).
+- Both elements' Revit Element IDs now shown in the clash list, so a specific clashing
+  element can be referenced precisely — e.g. telling a contractor exactly which pipe to
+  move — without a separate lookup in Revit (1019).
+- CODEOWNERS and a CI workflow that syntax-checks every `script.py` change against
+  Python 2.7 (IronPython's baseline) on each pull request.
+
+### Changed
+- "Isolate current clash" reverts to its original, host-side-only scope (ticket 1009) —
+  link-side focus now lives entirely in the new, independent Section Box toggle above,
+  so either can be used without the other.
+
+### Known limitations (updated from v0.5.0)
+- The link-side element of a clash still can't be *isolated* by identity (a Revit API
+  ceiling) — Select still highlights it, and Section Box now additionally crops the view
+  down to the clash region in both models, which was the practical need this limitation
+  was blocking.
+
 ## [v0.5.0] - 2026-09-04
 
 First tagged release — the point-in-time snapshot of everything built and
